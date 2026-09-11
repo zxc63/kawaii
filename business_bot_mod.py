@@ -25,6 +25,7 @@
 """
 
 import asyncio
+import html as html_lib
 import io
 import json
 import logging
@@ -124,6 +125,8 @@ USER_TPL = {
     "name": "", "username": "", "first_seen": 0, "last_seen": 0,
     "banned": False, "cmds": 0, "caught": 0,
     "mode": None, "antidelete": True, "pairs": {},
+    "mode_level": "normal",    # soft | normal | max — сколько декора
+    "mode_bold": True,         # выделять твой текст жирным
     "ref": 0,                  # кто пригласил (deep link)
     "save_media": True,        # архивировать входящие медиа
     "save_own": False,         # архивировать и свои тоже
@@ -421,105 +424,92 @@ def stutter(word: str, chance=0.35) -> str:
 
 
 # ─────────────────────────────────────────────────────────
+#  СБОРКА: твой текст — ядро, стиль — оболочка вокруг
+# ─────────────────────────────────────────────────────────
+#  Принцип: что ты написал, должно читаться сразу. Поэтому декор
+#  НЕ лезет внутрь фразы — он становится до и после неё, а сама
+#  фраза по желанию выделяется жирным.
+#
+#  Уровни:
+#    soft   — только концовка + смайл, текст нетронут
+#    normal — вступление + концовка + смайл, текст нетронут
+#    max    — плюс подстановки слов и заикание внутри фразы
+LEVELS = ("soft", "normal", "max")
+
+
+def assemble(body: str, opener: str, closer: str, kao: str,
+             level: str, bold: bool) -> str:
+    """Собрать финальное сообщение из ядра и декора."""
+    body = body.strip()
+    if bold and body:
+        body = f"<b>{body}</b>"
+
+    parts = []
+    if level != "soft" and opener and maybe(0.8):
+        parts.append(opener)
+    parts.append(body)
+    if closer and maybe(0.85):
+        parts.append(closer)
+    res = " ".join(p for p in parts if p)
+    if kao and maybe(0.75):
+        res += " " + kao
+    return res
+
+
+# ─────────────────────────────────────────────────────────
 #  KAWAII
 # ─────────────────────────────────────────────────────────
 KAWAII_SUBS = {
-    "привет": ["привтик", "прив-прив", "хаюшки", "приветики"],
-    "пока": ["покашки", "бай-бай", "пока-пока"],
-    "спасибо": ["спасибки", "мерси~", "сэнкс~"],
-    "да": ["дя", "ага~", "угу~"],
-    "нет": ["неть", "не-а~", "нетушки"],
-    "хорошо": ["хорошоу", "окейушки", "ладушки"],
-    "друг": ["дружочек", "френдик"],
-    "сплю": ["спатки иду"],
-    "ем": ["кушаю~"],
-    "что": ["чо~", "щито", "чтоо"],
-    "класс": ["класень", "кайфуля"],
+    "привет": ["привтик", "прив-прив", "хаюшки"], "пока": ["покашки", "бай-бай"],
+    "спасибо": ["спасибки", "мерси~"], "да": ["дя", "ага~"], "нет": ["неть", "не-а~"],
+    "хорошо": ["хорошоу", "ладушки"], "что": ["чо~", "чтоо"],
 }
-KAWAII_TAILS = ["~", "~♡", " ✧", "♡", "~ ✨", ""]
+KAWAII_OPEN = ["", "", "ня~", "ммм~", "ой!", "уву,"]
+KAWAII_CLOSE = ["ня~", "мур~", "уву~", "мя~ ♡", "нявушки~", "~ ✨", "ня-ня~"]
 
 
-def kawaii(t: str) -> str:
-    words = t.split()
-    out = []
-    for w in words:
-        low = w.lower().strip(".,!?")
-        if low in KAWAII_SUBS and maybe(0.75):
-            w = random.choice(KAWAII_SUBS[low])
-        out.append(w)
-    t = " ".join(out)
-
-    if maybe(0.8):
-        t = t.replace("л", "ль").replace("р", "рь")
-    t = t.replace("!", "!" + random.choice(["♡", "✨", "!1"]))
-    if maybe(0.6):
-        t = t.replace("?", "?" + random.choice([" >_<", " owo", "?"]))
-
-    parts = [t]
-    if maybe(0.7):
-        parts.append(random.choice(NYA) + random.choice(KAWAII_TAILS))
-    if maybe(0.85):
-        parts.append(random.choice(KAO_CUTE))
-    return " ".join(parts)
+def kawaii(t: str, level="normal", bold=True) -> str:
+    if level == "max":
+        words = []
+        for w in t.split():
+            low = w.lower().strip(".,!?")
+            words.append(random.choice(KAWAII_SUBS[low])
+                         if low in KAWAII_SUBS and maybe(0.7) else w)
+        t = " ".join(words).replace("л", "ль").replace("р", "рь")
+    return assemble(t, random.choice(KAWAII_OPEN), random.choice(KAWAII_CLOSE),
+                    random.choice(KAO_CUTE), level, bold)
 
 
 # ─────────────────────────────────────────────────────────
-#  TSUNDERE — максимум вариативности
+#  TSUNDERE
 # ─────────────────────────────────────────────────────────
 TSUN_OPEN = [
-    "Н-не то чтобы я специально, но", "Х-хмф!", "Б-бака!", "Э-эй!",
-    "Н-ну…", "Т-только не подумай ничего такого, но", "Хмф.",
-    "Д-дурак, я же говорила —", "Ч-что?! Ладно, слушай:", "Пф, ну ладно.",
-    "Я-я не ради тебя это, просто", "Н-ничего особенного, просто",
+    "Н-не то чтобы я специально, но", "Х-хмф!", "Б-бака!", "Э-эй!", "Н-ну…",
+    "Т-только не подумай ничего такого:", "Хмф.", "Д-дурак, я же говорила —",
+    "Ч-что?! Ладно, слушай:", "Пф, ну ладно.", "Я-я не ради тебя это, просто",
 ]
 TSUN_CLOSE = [
-    "…и вообще, мне всё равно!", "…б-бака.", "…не благодари, ясно?!",
-    "Хмф!", "…я просто мимо проходила, понял?", "…н-не смотри так!",
-    "…это ничего не значит!", "…всё, разговор окончен!",
+    "…и вообще, мне всё равно!", "…б-бака.", "…не благодари, ясно?!", "Хмф!",
+    "…я просто мимо проходила, понял?", "…н-не смотри так!", "…это ничего не значит!",
     "…и не вздумай зазнаваться.", "…д-дурак.", "…п-понял меня?!",
 ]
-TSUN_MID = [
-    "…ну, в смысле…", "…э-это не то, что ты подумал!", "…ай, неважно!",
-    "…с-скажем так.", "…н-но не радуйся!",
-]
-TSUN_SUBS = {
-    "ты": ["ты, дурак,", "т-ты"],
-    "да": ["н-ну да", "д-да", "ага, и что?"],
-    "нет": ["н-нет!", "конечно нет!", "вот ещё"],
-    "спасибо": ["с-спасибо… наверное", "ну… спасибо"],
-    "люблю": ["н-ничего я не люблю!", "мне просто нравится, и всё"],
-    "хорошо": ["л-ладно уж", "ну хорошо", "так и быть"],
-    "привет": ["п-привет", "а, это ты"],
-}
+TSUN_SUBS = {"да": ["н-ну да", "д-да"], "нет": ["н-нет!", "вот ещё"],
+             "ты": ["т-ты"], "спасибо": ["ну… спасибо"], "хорошо": ["л-ладно уж"]}
 
 
-def tsundere(t: str) -> str:
-    words = t.split()
-    out = []
-    for i, w in enumerate(words):
-        low = w.lower().strip(".,!?")
-        if low in TSUN_SUBS and maybe(0.6):
-            w = random.choice(TSUN_SUBS[low])
-        elif i == 0 or maybe(0.18):
-            w = stutter(w)
-        out.append(w)
-    body = " ".join(out)
-
-    # вставка в середину — иногда
-    if len(words) > 6 and maybe(0.3):
-        cut = len(out) // 2
-        body = " ".join(out[:cut] + [random.choice(TSUN_MID)] + out[cut:])
-
-    parts = []
-    if maybe(0.75):
-        parts.append(random.choice(TSUN_OPEN))
-    parts.append(body if parts else body[:1].upper() + body[1:])
-    if maybe(0.8):
-        parts.append(random.choice(TSUN_CLOSE))
-    res = " ".join(parts)
-    if maybe(0.7):
-        res += " " + random.choice(KAO_TSUN)
-    return res
+def tsundere(t: str, level="normal", bold=True) -> str:
+    if level == "max":
+        words = []
+        for i, w in enumerate(t.split()):
+            low = w.lower().strip(".,!?")
+            if low in TSUN_SUBS and maybe(0.6):
+                w = random.choice(TSUN_SUBS[low])
+            elif i == 0 or maybe(0.15):
+                w = stutter(w)
+            words.append(w)
+        t = " ".join(words)
+    return assemble(t, random.choice(TSUN_OPEN), random.choice(TSUN_CLOSE),
+                    random.choice(KAO_TSUN), level, bold)
 
 
 # ─────────────────────────────────────────────────────────
@@ -530,21 +520,16 @@ YAN_CLOSE = [
     "Ты ведь только мой, да?~ 🔪♡", "Я никому тебя не отдам… никогда~",
     "Не смотри на других, хорошо?~ ♡", "Мы будем вместе. Навсегда. ♡",
     "Я знаю, где ты сейчас~ ♡", "Ты же не бросишь меня, правда?~",
-    "Я всё о тебе знаю… и это нормально~", "Только не заставляй меня грустить~ 🔪",
+    "Только не заставляй меня грустить~ 🔪",
 ]
 
 
-def yandere(t: str) -> str:
-    parts = [p for p in (random.choice(YAN_OPEN), t) if p]
-    res = " ".join(parts)
-    if maybe(0.85):
-        res += " " + random.choice(YAN_CLOSE)
-    if maybe(0.5):
-        res += " " + random.choice(KAO_YAN)
-    return res
+def yandere(t: str, level="normal", bold=True) -> str:
+    return assemble(t, random.choice(YAN_OPEN), random.choice(YAN_CLOSE),
+                    random.choice(KAO_YAN), level, bold)
 
 
-def leet(t: str) -> str:
+def leet(t: str, level="normal", bold=False) -> str:
     return t.translate(str.maketrans({"a": "4", "e": "3", "i": "1", "o": "0", "s": "5",
                                       "t": "7", "а": "@", "е": "3", "о": "0", "и": "1"}))
 
@@ -773,7 +758,9 @@ async def on_business_message(m: Message):
 
     mode = u["pairs"].get(str(m.chat.id)) or u["mode"]
     if mode and mode in MODES and text.strip():
-        await replace_with(m, MODES[mode](text))
+        await replace_with(m, MODES[mode](html_lib.escape(text),
+                                          u.get("mode_level", "normal"),
+                                          u.get("mode_bold", True)))
 
 
 async def drop(m: Message) -> bool:
@@ -884,6 +871,8 @@ CMD_HELP = """✨ <b>Команды</b> (префикс <code>.</code>)
 <b>Моды</b>
 <code>.mode kawaii|tsundere|yandere|leet|off</code>
 <code>.kawaii</code> <code>.tsundere</code> <code>.yandere</code> <code>.leet</code>
+<code>.style soft|normal|max</code> — сколько декора
+<code>.style bold</code> — выделять свой текст жирным
 <code>.pair kawaii</code> · <code>.unpair</code> · <code>.pairs</code>
 
 <b>Архив медиа</b> 📦
@@ -989,8 +978,28 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         save()
         return await note(f"✅ Мод: <b>{a}</b> ♡")
 
+    if name == "style":
+        a = args.strip().lower()
+        if a in LEVELS:
+            u["mode_level"] = a
+            save(uid)
+            return await note(f"🎚 Интенсивность: <b>{a}</b>")
+        if a in ("bold", "жирный"):
+            u["mode_bold"] = not u["mode_bold"]
+            save(uid)
+            return await note(f"🔠 Выделять твой текст: "
+                              f"{'да ✅' if u['mode_bold'] else 'нет ❌'}")
+        return await note(
+            "🎚 <code>.style soft|normal|max</code> — сколько декора\n"
+            "<code>.style bold</code> — выделять твой текст жирным\n\n"
+            f"Сейчас: <b>{u.get('mode_level','normal')}</b>, "
+            f"жирный {'вкл' if u.get('mode_bold', True) else 'выкл'}")
+
     if name in MODES:
-        return await out(MODES[name](args or (rep.text if rep and rep.text else " ")))
+        src = args or (rep.text if rep and rep.text else " ")
+        return await out(MODES[name](html_lib.escape(src),
+                                     u.get("mode_level", "normal"),
+                                     u.get("mode_bold", True)))
     if name == "sw":
         return await out(switch_layout(args or (rep.text if rep else "")))
     if name == "flip":
@@ -1454,6 +1463,14 @@ MINI_APP = """<!doctype html><html><head><meta charset="utf-8">
     <option value="tsundere">tsundere</option><option value="yandere">yandere</option>
     <option value="leet">leet</option></select></div>
 
+<div class="row"><div><b>Интенсивность</b><small>сколько стиля вокруг текста</small></div>
+  <select id="level" onchange="setKey('mode_level',this.value)">
+    <option value="soft">мягко</option><option value="normal">обычно</option>
+    <option value="max">максимум</option></select></div>
+<div class="row"><div><b>Выделять мой текст</b><small>твоя фраза жирным, декор обычным</small></div>
+  <label class="sw"><input type="checkbox" id="bold"
+   onchange="setKey('mode_bold',this.checked)"><span class="sl"></span></label></div>
+
 <h2>Сохранение</h2>
 <div id="box"></div>
 <script>
@@ -1477,11 +1494,12 @@ async function load(){
  const d = await api("/api/state");
  if(d.error){document.body.innerHTML="<p>Открой это из чата с ботом 🙃</p>";return}
  s_media.textContent=d.media; s_caught.textContent=d.caught; s_pairs.textContent=d.pairs;
- mode.value = d.mode || "";
+ mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold;
  box.innerHTML = T.map(([k,t,dd])=>row(k,t,dd,d[k])).join("");
 }
 async function toggle(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
 async function setMode(v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:"mode",val:v}) }
+async function setKey(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
 load();
 </script></body></html>"""
 
@@ -1500,6 +1518,7 @@ async def api_state(request):
         else await st.media_stats(uid)
     return web.json_response({
         "mode": u["mode"], "antidelete": u["antidelete"],
+        "mode_level": u.get("mode_level", "normal"), "mode_bold": u.get("mode_bold", True),
         "save_media": u["save_media"], "save_own": u["save_own"],
         "scam": u["antiscam"]["enabled"], "filter": u["filter"]["enabled"],
         "media": n, "caught": u["caught"], "pairs": len(u["pairs"]),
@@ -1514,6 +1533,10 @@ async def api_set(request):
     u, k, v = user(uid), body.get("key"), body.get("val")
     if k == "mode":
         u["mode"] = v if v in MODES else None
+    elif k == "mode_level":
+        u["mode_level"] = v if v in LEVELS else "normal"
+    elif k == "mode_bold":
+        u["mode_bold"] = bool(v)
     elif k == "scam":
         u["antiscam"]["enabled"] = bool(v)
     elif k == "filter":
