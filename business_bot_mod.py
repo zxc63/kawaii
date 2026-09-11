@@ -49,8 +49,8 @@ from aiogram.types import (
 )
 
 # ═════════════════════════════════════════════════════════
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN"
-ADMINS = [123456789]              # <-- твой telegram id
+BOT_TOKEN = "8885086807:AAFZsEiQs453KNvErzthMNqXg75VVhcgAog"
+ADMINS = [6958994529]              # <-- твой telegram id
 PREFIX = "."
 DB_FILE = "bot.db"
 CACHE_LIMIT = 8000
