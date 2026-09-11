@@ -35,7 +35,18 @@ import subprocess
 import tempfile
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# Сервер живёт в UTC. TZ_OFFSET — твой сдвиг в часах (Люксембург: 1 зимой, 2 летом)
+TZ_OFFSET = float(os.getenv("TZ_OFFSET", "2"))
+
+
+def now_local() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET)
+
+
+def ts_local(ts) -> datetime:
+    return datetime.fromtimestamp(ts, timezone.utc) + timedelta(hours=TZ_OFFSET)
 
 import aiohttp
 from aiohttp import web
@@ -561,9 +572,12 @@ async def archive_media(m: Message, owner_id: int, forced=False) -> str | None:
     c = conn_of(owner_id)
     if not c:
         return None
-    who = m.from_user.full_name if m.from_user else "?"
+    who = ((m.from_user.full_name if m.from_user else "") or "").strip()
+    if not who:
+        who = getattr(m.chat, "full_name", None) or getattr(m.chat, "title", None) \
+            or f"id {m.chat.id}"
     cap = (f"📦 <b>{kind}</b> · {who}\n"
-           f"💬 чат <code>{m.chat.id}</code> · {datetime.now():%d.%m %H:%M}")
+           f"💬 чат <code>{m.chat.id}</code> · {now_local():%d.%m %H:%M}")
     if m.caption:
         cap += f"\n\n{m.caption[:300]}"
 
@@ -576,6 +590,7 @@ async def archive_media(m: Message, owner_id: int, forced=False) -> str | None:
             saved_id, note = msg.message_id, "copied (>20MB)"
         else:
             data = (await bot.download(file_id)).read()
+            size = size or len(data)          # у фото file_size бывает пустой
             fname = getattr(obj, "file_name", None) or f"{kind}_{file_uid}"
             file = BufferedInputFile(data, fname)
             sender = {"photo": bot.send_photo, "video": bot.send_video,
@@ -878,13 +893,23 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         return await note(f"📦 Архив медиа: {'вкл ✅' if u['save_media'] else 'выкл ❌'}")
 
     if name == "media":
+        def plural(n, forms=("файл", "файла", "файлов")):
+            n10, n100 = n % 10, n % 100
+            if n10 == 1 and n100 != 11:
+                return forms[0]
+            if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+                return forms[1]
+            return forms[2]
+
         n, sz = st.media_stats(uid) if not asyncio.iscoroutinefunction(st.media_stats) \
             else await st.media_stats(uid)
         rows = st.recent_media(uid, 5) if not asyncio.iscoroutinefunction(st.recent_media) \
             else await st.recent_media(uid, 5)
         lines = [f"• {r['kind']} от <code>{r['sender']}</code> · "
-                 f"{datetime.fromtimestamp(r['ts']):%d.%m %H:%M}" for r in rows]
-        return await note(f"📦 <b>Архив</b>: {n} файлов, {sz/1048576:.1f} МБ\n\n"
+                 f"{ts_local(r['ts']):%d.%m %H:%M}" for r in rows]
+        vol = (f"{sz/1048576:.1f} МБ" if sz >= 1048576
+               else f"{sz/1024:.0f} КБ" if sz else "размер неизвестен")
+        return await note(f"📦 <b>Архив</b>: {n} {plural(n)}, {vol}\n\n"
                           + ("\n".join(lines) or "пусто"))
 
     # ── медиа ──
@@ -1294,8 +1319,8 @@ async def cmd_u(m: Message):
         f"🔪 Фильтр: {'вкл' if u['filter']['enabled'] else 'выкл'} · поймано {u['caught']}\n"
         f"💬 Диалогов: {st.counts(int(a[1]))[0]} · ✅ доверенных: {st.counts(int(a[1]))[1]}\n"
         f"⌨️ Команд: {u['cmds']}\n"
-        f"📅 С {datetime.fromtimestamp(u['first_seen']):%d.%m.%Y} · "
-        f"был {datetime.fromtimestamp(u['last_seen']):%d.%m %H:%M}")
+        f"📅 С {ts_local(u['first_seen']):%d.%m.%Y} · "
+        f"был {ts_local(u['last_seen']):%d.%m %H:%M}")
 
 
 @dp.message(Command("find"))
@@ -1325,7 +1350,7 @@ async def cmd_log(m: Message):
         return await m.answer("📭 Пока ничего не поймано.")
     out = []
     for r in rows:
-        when = datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M")
+        when = ts_local(r["ts"]).strftime("%d.%m %H:%M")
         mark = "🗑" if r["action"] == "deleted" else "⚠️"
         out.append(f"{mark} <b>{when}</b> · <code>{r['peer']}</code> · "
                    f"{r['reason']} [{r['score']}]\n<i>{(r['text'] or '')[:90]}</i>")
