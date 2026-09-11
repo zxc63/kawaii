@@ -109,6 +109,7 @@ USER_TPL = {
     "name": "", "username": "", "first_seen": 0, "last_seen": 0,
     "banned": False, "cmds": 0, "caught": 0,
     "mode": None, "antidelete": True, "pairs": {},
+    "ref": 0,                  # кто пригласил (deep link)
     "save_media": True,        # архивировать входящие медиа
     "save_own": False,         # архивировать и свои тоже
     "antiscam": dict(ANTISCAM_TPL), "filter": dict(FILTER_TPL),
@@ -443,8 +444,26 @@ async def on_connect(bc: BusinessConnection):
                 miss.append("удалять отправленные (для модов)")
             if not r.can_delete_all_messages:
                 miss.append("удалять любые (для автоудаления скама)")
-        warn = ("\n\n⚠️ <b>Не выданы права:</b> " + ", ".join(miss)) if miss else ""
-        await bot.send_message(bc.user_chat_id, "✅ Подключено! /start — меню." + warn)
+        warn = ("\n\n⚠️ <b>Не выданы права:</b> " + ", ".join(miss) +
+                "\nДобавь их там же, где подключал — иначе часть функций молчит.") if miss else ""
+        await bot.send_message(
+            bc.user_chat_id,
+            "✅ <b>Подключено!</b>\n\n"
+            "Уже работает:\n"
+            "🗑 сохранение удалённых сообщений\n"
+            "📦 архив медиа\n"
+            "🛡 антискам на первых сообщениях\n\n"
+            "Команды пишешь <b>сам в любом чате</b> с точкой: <code>.help</code>\n"
+            "Настройки — /start" + warn,
+            reply_markup=main_kb(uid))
+        for a in ADMINS:                       # пинг владельцу бота
+            if a != uid:
+                try:
+                    await bot.send_message(
+                        a, f"🔌 Новое подключение: <b>{bc.user.full_name}</b> "
+                           f"(@{bc.user.username or '—'}, <code>{uid}</code>)")
+                except Exception:
+                    pass
     else:
         st.drop_connection(uid)
 
@@ -715,6 +734,7 @@ CMD_HELP = """✨ <b>Команды</b> (префикс <code>.</code>)
 <code>.gif</code> <code>.fv</code> <code>.lq</code> <code>.story</code> <code>.nk</code>
 
 <b>Прочее</b>
+<code>/invite</code> — позвать друга · <code>/setup</code> — инструкция
 <code>.type</code> <code>.sw</code> <code>.flip</code> <code>.dice</code> <code>.love</code> <code>.ad</code> <code>.me</code>
 """
 
@@ -971,6 +991,66 @@ async def on_pair(cb: CallbackQuery):
     await cb.answer("Готово!")
 
 
+
+# ═════════════════════════════════════════════════════════
+#  ОНБОРДИНГ ДЛЯ НОВЫХ ЛЮДЕЙ
+# ═════════════════════════════════════════════════════════
+#  ⚠️ ГЛАВНОЕ: в @BotFather включи Business Mode, иначе бота
+#     физически НЕ БУДЕТ в списке чат-ботов у пользователя:
+#       /mybots → выбрать бота → Bot Settings → Business Mode → Enable
+#
+#  Premium для подключения НЕ нужен: большинство бизнес-функций
+#  требуют подписку, но подключение чат-бота доступно всем.
+SETUP_STEPS = """🚀 <b>Как подключить бота к себе</b>
+
+<b>1.</b> Настройки Telegram → <b>Telegram для бизнеса</b>
+   <i>(если раздела нет — обнови приложение)</i>
+
+<b>2.</b> Пункт <b>Чат-боты</b>
+
+<b>3.</b> Вставь туда: {username}
+
+<b>4.</b> Выдай права — все пять:
+   ✅ Читать сообщения
+   ✅ Отвечать на сообщения
+   ✅ Удалять отправленные сообщения
+   ✅ Удалять любые сообщения
+   ✅ (остальные по желанию)
+
+<b>5.</b> Выбери чаты, где бот работает
+   <i>«Все чаты» — или только нужные</i>
+
+Premium для этого <b>не нужен</b>.
+Как закончишь — жми «Проверить» ниже 👇"""
+
+
+def setup_kb(username) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить подключение", callback_data="m:check")],
+        [InlineKeyboardButton(text="❓ Не получается", callback_data="m:trouble")],
+    ])
+
+
+TROUBLE = """🔧 <b>Если не выходит</b>
+
+<b>Бота нет в списке чат-ботов</b>
+У владельца бота не включён Business Mode в @BotFather.
+
+<b>Нет раздела «Telegram для бизнеса»</b>
+Обнови приложение. На очень старых версиях раздела нет.
+
+<b>Подключил, но ничего не происходит</b>
+Проверь, что в настройках выбраны чаты («Все чаты» проще всего)
+и что выданы права на чтение и ответы.
+
+<b>Моды не работают</b>
+Не выдано право «удалять отправленные сообщения» — бот не может
+подменить твоё сообщение на обработанное.
+
+<b>Скам не удаляется, только уведомления</b>
+Не выдано право «удалять любые сообщения»."""
+
+
 # ═════════════════════════════════════════════════════════
 #  МЕНЮ
 # ═════════════════════════════════════════════════════════
@@ -1046,6 +1126,24 @@ async def menu(cb: CallbackQuery):
     u = user(uid, cb.from_user)
     back = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="‹ Назад", callback_data="m:root")]])
+    if what == "check":
+        me = await bot.get_me()
+        if conn_of(uid):
+            r = None
+            await cb.message.edit_text(
+                "✅ <b>Подключено!</b>\n\nБот теперь работает в выбранных чатах.\n"
+                "Ниже — настройки, всё уже включено по умолчанию.",
+                reply_markup=main_kb(uid))
+            await cb.answer("Есть контакт!")
+        else:
+            await cb.answer("Пока не вижу подключения — проверь шаг 3", show_alert=True)
+        return
+    if what == "trouble":
+        await cb.message.edit_text(TROUBLE, reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить",
+                                                   callback_data="m:check")]]))
+        await cb.answer()
+        return
     if what == "scam":
         await cb.message.edit_text(
             "🛡 <b>Антискам</b>\n\nПроверяет первые сообщения от новых собеседников: "
