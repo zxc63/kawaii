@@ -38,6 +38,8 @@ from collections import OrderedDict
 from datetime import datetime
 
 import aiohttp
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from storage import Storage
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -49,7 +51,21 @@ from aiogram.types import (
 )
 
 # ═════════════════════════════════════════════════════════
-BOT_TOKEN = "8885086807:AAFZsEiQs453KNvErzthMNqXg75VVhcgAog"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN")
+
+# ── Хостинг ──────────────────────────────────────────────
+#  Render (и любой PaaS с веб-сервисом) требует открытый порт и не даёт
+#  гарантий, что старый инстанс умер до старта нового → при поллинге
+#  получаешь TelegramConflictError: terminated by other getUpdates.
+#  Поэтому на хостинге работаем ВЕБХУКАМИ: Telegram сам стучится к нам,
+#  порт открыт, второй инстанс физически не может «перехватить» апдейты.
+#
+#  Render сам выставляет RENDER_EXTERNAL_URL и PORT.
+#  Локально ничего не задаёшь → включится обычный поллинг.
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-please")
+WEBHOOK_PATH = "/tg/webhook"
 ADMINS = [6958994529]              # <-- твой telegram id
 PREFIX = "."
 DB_FILE = "bot.db"
@@ -1099,17 +1115,69 @@ async def cmd_bc(m: Message):
 
 
 # ═════════════════════════════════════════════════════════
-async def main():
+async def on_startup():
+    """Вешаем вебхук. drop_pending_updates выкидывает очередь, накопившуюся
+    пока инстансы конфликтовали — иначе бот сразу захлебнётся старьём."""
+    url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+    await bot.set_webhook(
+        url=url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        max_connections=40,
+        allowed_updates=ALLOWED_UPDATES)
+    info = await bot.get_webhook_info()
+    logging.info("webhook: %s (ожидает: %s)", info.url, info.pending_update_count)
+
+
+async def health(request):
+    """Render сканирует порт и пингует сервис — отвечаем 200."""
+    return web.json_response({"ok": True, "users": st.stats()["total"]})
+
+
+ALLOWED_UPDATES = ["message", "callback_query", "business_connection",
+                   "business_message", "edited_business_message",
+                   "deleted_business_messages"]
+
+
+async def run_webhook():
     asyncio.create_task(st.flush_loop(5))
+    dp.startup.register(on_startup)
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    SimpleRequestHandler(dispatcher=dp, bot=bot,
+                         secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)     # ← порт, который ищет Render
+    await site.start()
     me = await bot.get_me()
-    print(f"♡ @{me.username} запущен. Юзеров в базе: {st.stats()['total']}")
-    await dp.start_polling(bot, allowed_updates=[
-        "message", "callback_query", "business_connection", "business_message",
-        "edited_business_message", "deleted_business_messages"])
+    print(f"♡ @{me.username} на вебхуках, порт {PORT}. Юзеров: {st.stats()['total']}")
+    await asyncio.Event().wait()                     # держим процесс
+
+
+async def run_polling():
+    asyncio.create_task(st.flush_loop(5))
+    # если раньше стоял вебхук — снимаем, иначе Telegram не отдаст апдейты
+    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    print(f"♡ @{me.username} на поллинге. Юзеров: {st.stats()['total']}")
+    await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
+
+
+async def main():
+    if WEBHOOK_BASE:
+        await run_webhook()
+    else:
+        await run_polling()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
     finally:
         st.close()          # дописать хвост на диск при выходе
