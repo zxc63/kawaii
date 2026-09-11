@@ -60,8 +60,8 @@ from aiogram.types import (
 # ═════════════════════════════════════════════════════════
 #  КОНФИГ
 # ═════════════════════════════════════════════════════════
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN"
-ADMINS = [123456789]            # <-- твой telegram id
+BOT_TOKEN = "8885086807:AAFZsEiQs453KNvErzthMNqXg75VVhcgAog"
+ADMINS = [6958994529]            # <-- твой telegram id
 PREFIX = "."
 STATE_FILE = "bizbot_state.json"
 CACHE_LIMIT = 8000
