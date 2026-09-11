@@ -127,6 +127,7 @@ USER_TPL = {
     "mode": None, "antidelete": True, "pairs": {},
     "mode_level": "normal",    # soft | normal | max — сколько декора
     "mode_bold": True,         # выделять твой текст жирным
+    "mode_emoji": True,        # добавлять эмодзи под настроение режима
     "ref": 0,                  # кто пригласил (deep link)
     "save_media": True,        # архивировать входящие медиа
     "save_own": False,         # архивировать и свои тоже
@@ -411,6 +412,13 @@ KAO_TSUN = ["(>﹏<)", "(๑•̀ㅁ•́๑)", "(￣^￣)", "(¬_¬)", "(//∇/
 KAO_YAN = ["(◡‿◡✿)", "( ͡° ͜ʖ ͡°)", "(๑•̀ㅂ•́)✧", "(◕‿◕)", "(⌒▽⌒)", "( ˘ω˘ )"]
 NYA = ["ня", "ня~", "мур", "мурр~", "уву", "мяу", "нявушки", "няш", "мя~", "пурр"]
 
+# эмодзи по настроению режима — ставятся ТОЛЬКО вокруг текста
+EMO_KAWAII = ["🌸", "🍡", "🧸", "🐾", "✨", "💗", "🍓", "🫧", "🐰", "🍰", "☁️", "🌷",
+              "💫", "🐱", "🧁", "🪷", "🎀", "🍬"]
+EMO_TSUN = ["😤", "💢", "🙄", "😳", "🔥", "💥", "😾", "🫤", "😠", "💨", "🍂", "❄️"]
+EMO_YAN = ["🔪", "🩸", "💘", "🖤", "🕯️", "🥀", "⛓️", "👁️", "💉", "🌑", "🫀"]
+EMO_LEET = ["💾", "🖥️", "👾", "🕹️", "📟", "⚡", "🔌", "💿"]
+
 
 def maybe(chance: float) -> bool:
     return random.random() < chance
@@ -438,22 +446,38 @@ LEVELS = ("soft", "normal", "max")
 
 
 def assemble(body: str, opener: str, closer: str, kao: str,
-             level: str, bold: bool) -> str:
-    """Собрать финальное сообщение из ядра и декора."""
+             level: str, bold: bool, emoji: list | None = None,
+             use_emoji: bool = True) -> str:
+    """Собрать финальное сообщение: ядро (твой текст) + декор вокруг.
+
+    Эмодзи и каомодзи никогда не попадают ВНУТРЬ фразы — только по краям,
+    чтобы написанное читалось с первого взгляда.
+    """
     body = body.strip()
     if bold and body:
         body = f"<b>{body}</b>"
 
+    # сколько эмодзи: мягко — одно, максимум — до трёх
+    pool = emoji if (emoji and use_emoji) else []
+    n = {"soft": 1, "normal": 2, "max": 3}.get(level, 2)
+    picked = random.sample(pool, min(n, len(pool))) if pool and maybe(0.85) else []
+
+    head = picked.pop() if picked and maybe(0.45) else ""
+
     parts = []
+    if head:
+        parts.append(head)
     if level != "soft" and opener and maybe(0.8):
         parts.append(opener)
     parts.append(body)
     if closer and maybe(0.85):
         parts.append(closer)
     res = " ".join(p for p in parts if p)
-    if kao and maybe(0.75):
-        res += " " + kao
-    return res
+
+    tail = " ".join(picked)
+    if kao and maybe(0.6):
+        tail = (tail + " " + kao).strip()
+    return (res + " " + tail).strip() if tail else res
 
 
 # ─────────────────────────────────────────────────────────
@@ -468,7 +492,7 @@ KAWAII_OPEN = ["", "", "ня~", "ммм~", "ой!", "уву,"]
 KAWAII_CLOSE = ["ня~", "мур~", "уву~", "мя~ ♡", "нявушки~", "~ ✨", "ня-ня~"]
 
 
-def kawaii(t: str, level="normal", bold=True) -> str:
+def kawaii(t: str, level="normal", bold=True, emoji=True) -> str:
     if level == "max":
         words = []
         for w in t.split():
@@ -477,7 +501,7 @@ def kawaii(t: str, level="normal", bold=True) -> str:
                          if low in KAWAII_SUBS and maybe(0.7) else w)
         t = " ".join(words).replace("л", "ль").replace("р", "рь")
     return assemble(t, random.choice(KAWAII_OPEN), random.choice(KAWAII_CLOSE),
-                    random.choice(KAO_CUTE), level, bold)
+                    random.choice(KAO_CUTE), level, bold, EMO_KAWAII, emoji)
 
 
 # ─────────────────────────────────────────────────────────
@@ -497,7 +521,7 @@ TSUN_SUBS = {"да": ["н-ну да", "д-да"], "нет": ["н-нет!", "во
              "ты": ["т-ты"], "спасибо": ["ну… спасибо"], "хорошо": ["л-ладно уж"]}
 
 
-def tsundere(t: str, level="normal", bold=True) -> str:
+def tsundere(t: str, level="normal", bold=True, emoji=True) -> str:
     if level == "max":
         words = []
         for i, w in enumerate(t.split()):
@@ -509,7 +533,7 @@ def tsundere(t: str, level="normal", bold=True) -> str:
             words.append(w)
         t = " ".join(words)
     return assemble(t, random.choice(TSUN_OPEN), random.choice(TSUN_CLOSE),
-                    random.choice(KAO_TSUN), level, bold)
+                    random.choice(KAO_TSUN), level, bold, EMO_TSUN, emoji)
 
 
 # ─────────────────────────────────────────────────────────
@@ -524,14 +548,17 @@ YAN_CLOSE = [
 ]
 
 
-def yandere(t: str, level="normal", bold=True) -> str:
+def yandere(t: str, level="normal", bold=True, emoji=True) -> str:
     return assemble(t, random.choice(YAN_OPEN), random.choice(YAN_CLOSE),
-                    random.choice(KAO_YAN), level, bold)
+                    random.choice(KAO_YAN), level, bold, EMO_YAN, emoji)
 
 
-def leet(t: str, level="normal", bold=False) -> str:
-    return t.translate(str.maketrans({"a": "4", "e": "3", "i": "1", "o": "0", "s": "5",
-                                      "t": "7", "а": "@", "е": "3", "о": "0", "и": "1"}))
+def leet(t: str, level="normal", bold=False, emoji=True) -> str:
+    out = t.translate(str.maketrans({"a": "4", "e": "3", "i": "1", "o": "0", "s": "5",
+                                     "t": "7", "а": "@", "е": "3", "о": "0", "и": "1"}))
+    if emoji and maybe(0.6):
+        out += " " + random.choice(EMO_LEET)
+    return out
 
 
 MODES = {"kawaii": kawaii, "tsundere": tsundere, "yandere": yandere, "leet": leet}
@@ -760,7 +787,8 @@ async def on_business_message(m: Message):
     if mode and mode in MODES and text.strip():
         await replace_with(m, MODES[mode](html_lib.escape(text),
                                           u.get("mode_level", "normal"),
-                                          u.get("mode_bold", True)))
+                                          u.get("mode_bold", True),
+                                          u.get("mode_emoji", True)))
 
 
 async def drop(m: Message) -> bool:
@@ -872,7 +900,7 @@ CMD_HELP = """✨ <b>Команды</b> (префикс <code>.</code>)
 <code>.mode kawaii|tsundere|yandere|leet|off</code>
 <code>.kawaii</code> <code>.tsundere</code> <code>.yandere</code> <code>.leet</code>
 <code>.style soft|normal|max</code> — сколько декора
-<code>.style bold</code> — выделять свой текст жирным
+<code>.style bold</code> · <code>.style emoji</code>
 <code>.pair kawaii</code> · <code>.unpair</code> · <code>.pairs</code>
 
 <b>Архив медиа</b> 📦
@@ -984,6 +1012,10 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             u["mode_level"] = a
             save(uid)
             return await note(f"🎚 Интенсивность: <b>{a}</b>")
+        if a in ("emoji", "эмодзи"):
+            u["mode_emoji"] = not u["mode_emoji"]
+            save(uid)
+            return await note(f"😺 Эмодзи: {'вкл ✅' if u['mode_emoji'] else 'выкл ❌'}")
         if a in ("bold", "жирный"):
             u["mode_bold"] = not u["mode_bold"]
             save(uid)
@@ -991,7 +1023,8 @@ async def handle_cmd(m: Message, uid: int, raw: str):
                               f"{'да ✅' if u['mode_bold'] else 'нет ❌'}")
         return await note(
             "🎚 <code>.style soft|normal|max</code> — сколько декора\n"
-            "<code>.style bold</code> — выделять твой текст жирным\n\n"
+            "<code>.style bold</code> — выделять твой текст жирным\n"
+            "<code>.style emoji</code> — эмодзи вкл/выкл\n\n"
             f"Сейчас: <b>{u.get('mode_level','normal')}</b>, "
             f"жирный {'вкл' if u.get('mode_bold', True) else 'выкл'}")
 
@@ -999,7 +1032,8 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         src = args or (rep.text if rep and rep.text else " ")
         return await out(MODES[name](html_lib.escape(src),
                                      u.get("mode_level", "normal"),
-                                     u.get("mode_bold", True)))
+                                     u.get("mode_bold", True),
+                                     u.get("mode_emoji", True)))
     if name == "sw":
         return await out(switch_layout(args or (rep.text if rep else "")))
     if name == "flip":
@@ -1467,6 +1501,9 @@ MINI_APP = """<!doctype html><html><head><meta charset="utf-8">
   <select id="level" onchange="setKey('mode_level',this.value)">
     <option value="soft">мягко</option><option value="normal">обычно</option>
     <option value="max">максимум</option></select></div>
+<div class="row"><div><b>Эмодзи</b><small>под настроение режима</small></div>
+  <label class="sw"><input type="checkbox" id="emoji"
+   onchange="setKey('mode_emoji',this.checked)"><span class="sl"></span></label></div>
 <div class="row"><div><b>Выделять мой текст</b><small>твоя фраза жирным, декор обычным</small></div>
   <label class="sw"><input type="checkbox" id="bold"
    onchange="setKey('mode_bold',this.checked)"><span class="sl"></span></label></div>
@@ -1494,7 +1531,7 @@ async function load(){
  const d = await api("/api/state");
  if(d.error){document.body.innerHTML="<p>Открой это из чата с ботом 🙃</p>";return}
  s_media.textContent=d.media; s_caught.textContent=d.caught; s_pairs.textContent=d.pairs;
- mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold;
+ mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold; emoji.checked = !!d.mode_emoji;
  box.innerHTML = T.map(([k,t,dd])=>row(k,t,dd,d[k])).join("");
 }
 async function toggle(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
@@ -1519,6 +1556,7 @@ async def api_state(request):
     return web.json_response({
         "mode": u["mode"], "antidelete": u["antidelete"],
         "mode_level": u.get("mode_level", "normal"), "mode_bold": u.get("mode_bold", True),
+        "mode_emoji": u.get("mode_emoji", True),
         "save_media": u["save_media"], "save_own": u["save_own"],
         "scam": u["antiscam"]["enabled"], "filter": u["filter"]["enabled"],
         "media": n, "caught": u["caught"], "pairs": len(u["pairs"]),
@@ -1537,6 +1575,8 @@ async def api_set(request):
         u["mode_level"] = v if v in LEVELS else "normal"
     elif k == "mode_bold":
         u["mode_bold"] = bool(v)
+    elif k == "mode_emoji":
+        u["mode_emoji"] = bool(v)
     elif k == "scam":
         u["antiscam"]["enabled"] = bool(v)
     elif k == "filter":
