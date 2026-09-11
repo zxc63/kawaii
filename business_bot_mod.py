@@ -68,7 +68,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BufferedInputFile, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
+    BotCommand,
+    BufferedInputFile,
+    MenuButtonCommands,
+    MenuButtonWebApp,
+    WebAppInfo, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
     InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message,
 )
 
@@ -1371,6 +1375,170 @@ async def setmode(cb: CallbackQuery):
     await cb.answer("Сохранено")
 
 
+
+# ═════════════════════════════════════════════════════════
+#  МИНИ-ПРИЛОЖЕНИЕ (кнопка «Меню» у поля ввода)
+# ═════════════════════════════════════════════════════════
+#  Работает только в чате с ботом: в чужие диалоги Telegram
+#  кнопки не пускает. Страницу отдаёт наш же aiohttp-сервер,
+#  поэтому хостинг не нужен — тот же адрес, что и вебхук.
+BOT_COMMANDS = [
+    BotCommand(command="start", description="⚙️ Настройки"),
+    BotCommand(command="media", description="📦 Что в архиве"),
+    BotCommand(command="log", description="🔪 Срабатывания защиты"),
+    BotCommand(command="invite", description="🔗 Позвать друга"),
+    BotCommand(command="setup", description="🚀 Как подключить"),
+]
+
+
+def check_init_data(init_data: str) -> int | None:
+    """Проверить подпись Telegram и вернуть user_id. Без этого кто угодно
+    мог бы дёргать наш API и менять чужие настройки."""
+    import hashlib
+    import hmac
+    from urllib.parse import parse_qsl
+
+    try:
+        pairs = dict(parse_qsl(init_data, strict_parsing=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        return json.loads(pairs.get("user", "{}")).get("id")
+    except Exception:
+        return None
+
+
+MINI_APP = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;padding:16px;font:16px -apple-system,system-ui,sans-serif;
+      background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)}
+ h2{font-size:15px;text-transform:uppercase;letter-spacing:.04em;opacity:.55;
+    margin:22px 0 8px;font-weight:600}
+ .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:13px 14px;background:var(--tg-theme-secondary-bg-color,#f2f2f7);
+      border-radius:12px;margin-bottom:8px}
+ .row b{font-weight:500}
+ .row small{display:block;opacity:.5;font-size:12px;margin-top:2px}
+ .sw{position:relative;width:50px;height:30px;flex:none}
+ .sw input{opacity:0;width:0;height:0}
+ .sl{position:absolute;inset:0;background:#8888;border-radius:30px;
+     transition:.2s;cursor:pointer}
+ .sl:before{content:"";position:absolute;height:24px;width:24px;left:3px;top:3px;
+     background:#fff;border-radius:50%;transition:.2s}
+ input:checked+.sl{background:var(--tg-theme-button-color,#3390ec)}
+ input:checked+.sl:before{transform:translateX(20px)}
+ select{background:var(--tg-theme-bg-color,#fff);color:inherit;border:0;
+        font-size:16px;padding:6px;border-radius:8px}
+ .stat{display:flex;gap:10px;margin-bottom:14px}
+ .stat div{flex:1;text-align:center;padding:12px 6px;border-radius:12px;
+     background:var(--tg-theme-secondary-bg-color,#f2f2f7)}
+ .stat span{display:block;font-size:22px;font-weight:600}
+ .stat em{font-size:11px;opacity:.5;font-style:normal}
+</style></head><body>
+<div class="stat">
+  <div><span id="s_media">–</span><em>в архиве</em></div>
+  <div><span id="s_caught">–</span><em>поймано</em></div>
+  <div><span id="s_pairs">–</span><em>пар</em></div>
+</div>
+
+<h2>Стиль</h2>
+<div class="row"><div><b>Словесный мод</b><small>применяется ко всему, что пишешь</small></div>
+  <select id="mode" onchange="setMode(this.value)">
+    <option value="">выключен</option><option value="kawaii">kawaii</option>
+    <option value="tsundere">tsundere</option><option value="yandere">yandere</option>
+    <option value="leet">leet</option></select></div>
+
+<h2>Сохранение</h2>
+<div id="box"></div>
+<script>
+const tg = Telegram.WebApp; tg.ready(); tg.expand();
+const T = [
+ ["antidelete","Анти-делит","удалённые сообщения приходят тебе"],
+ ["save_media","Архив медиа","копии фото, видео и голосовых"],
+ ["save_own","Свои медиа","архивировать и то, что шлёшь сам"],
+ ["scam","Антискам","проверка первых сообщений"],
+ ["filter","Фильтр спама","удалять подозрительное автоматически"],
+];
+function row(k,t,d,v){return `<div class="row"><div><b>${t}</b><small>${d}</small></div>
+ <label class="sw"><input type="checkbox" ${v?"checked":""}
+ onchange="toggle('${k}',this.checked)"><span class="sl"></span></label></div>`}
+async function api(path,body={}){
+ const r = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({init:tg.initData,...body})});
+ return r.json();
+}
+async function load(){
+ const d = await api("/api/state");
+ if(d.error){document.body.innerHTML="<p>Открой это из чата с ботом 🙃</p>";return}
+ s_media.textContent=d.media; s_caught.textContent=d.caught; s_pairs.textContent=d.pairs;
+ mode.value = d.mode || "";
+ box.innerHTML = T.map(([k,t,dd])=>row(k,t,dd,d[k])).join("");
+}
+async function toggle(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
+async function setMode(v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:"mode",val:v}) }
+load();
+</script></body></html>"""
+
+
+async def page_app(request):
+    return web.Response(text=MINI_APP, content_type="text/html")
+
+
+async def api_state(request):
+    body = await request.json()
+    uid = check_init_data(body.get("init", ""))
+    if not uid:
+        return web.json_response({"error": "bad signature"}, status=403)
+    u = user(uid)
+    n, _ = st.media_stats(uid) if not asyncio.iscoroutinefunction(st.media_stats) \
+        else await st.media_stats(uid)
+    return web.json_response({
+        "mode": u["mode"], "antidelete": u["antidelete"],
+        "save_media": u["save_media"], "save_own": u["save_own"],
+        "scam": u["antiscam"]["enabled"], "filter": u["filter"]["enabled"],
+        "media": n, "caught": u["caught"], "pairs": len(u["pairs"]),
+    })
+
+
+async def api_set(request):
+    body = await request.json()
+    uid = check_init_data(body.get("init", ""))
+    if not uid:
+        return web.json_response({"error": "bad signature"}, status=403)
+    u, k, v = user(uid), body.get("key"), body.get("val")
+    if k == "mode":
+        u["mode"] = v if v in MODES else None
+    elif k == "scam":
+        u["antiscam"]["enabled"] = bool(v)
+    elif k == "filter":
+        u["filter"]["enabled"] = bool(v)
+    elif k in ("antidelete", "save_media", "save_own"):
+        u[k] = bool(v)
+    else:
+        return web.json_response({"error": "unknown key"}, status=400)
+    save(uid)
+    return web.json_response({"ok": True})
+
+
+async def setup_menu():
+    """Команды в «/» и кнопка «Меню» у поля ввода."""
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        if WEBHOOK_BASE:
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                text="⚙️ Меню", web_app=WebAppInfo(url=WEBHOOK_BASE.rstrip("/") + "/app")))
+        else:
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as ex:
+        logging.warning("menu: %s", ex)
+
+
 # ═════════════════════════════════════════════════════════
 #  АДМИНКА (модерация)
 # ═════════════════════════════════════════════════════════
@@ -1574,9 +1742,13 @@ async def run_webhook():
     await storage_start()
     asyncio.create_task(st.flush_loop(5))
     dp.startup.register(on_startup)
+    await setup_menu()
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/app", page_app)          # мини-приложение
+    app.router.add_post("/api/state", api_state)
+    app.router.add_post("/api/set", api_set)
     SimpleRequestHandler(dispatcher=dp, bot=bot,
                          secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
@@ -1595,6 +1767,7 @@ async def run_polling():
     asyncio.create_task(st.flush_loop(5))
     # если раньше стоял вебхук — снимаем, иначе Telegram не отдаст апдейты
     await bot.delete_webhook(drop_pending_updates=True)
+    await setup_menu()
     me = await bot.get_me()
     print(f"♡ @{me.username} на поллинге. Юзеров: {st.stats()['total']}")
     await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
