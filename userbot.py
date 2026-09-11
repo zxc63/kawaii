@@ -42,8 +42,8 @@ from telethon.errors import MessageNotModifiedError
 # ─────────────────────────────────────────────────────────
 #  КОНФИГ  — вставь свои api_id / api_hash с my.telegram.org
 # ─────────────────────────────────────────────────────────
-API_ID = 123456                     # <-- сюда
-API_HASH = "your_api_hash_here"     # <-- сюда
+API_ID = 39159182                      # <-- сюда
+API_HASH = "28a1abc765ac84766ec2da78560fb534"     # <-- сюда
 SESSION = "karzen_userbot"
 PREFIX = "."
 
