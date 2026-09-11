@@ -1,0 +1,4 @@
+aiogram>=3.15
+aiohttp>=3.9
+pillow>=10
+asyncpg>=0.29        # нужен только если используешь storage_pg (Neon)
