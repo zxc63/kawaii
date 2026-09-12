@@ -22,6 +22,7 @@
   💤 АВТООТВЕТ — «я отошёл» на первое сообщение
   📬 СВОДКА — итоги дня одним сообщением
   🎬 МЕДИА — .gif .fv .lq .story .type · картинки .nk .nkb
+            · гифки-реакции .g обнять / .g погладить
   🎲 МЕЛОЧИ — .pick .8ball .roll .zalgo .space …
   🛠 АДМИНКА — статистика, список юзеров, бан, рассылка
 
@@ -80,6 +81,7 @@ from aiogram.types import (
     MenuButtonWebApp,
     WebAppInfo, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
     InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message,
+    ReplyParameters,
 )
 
 # ═════════════════════════════════════════════════════════
@@ -1258,7 +1260,59 @@ NEKO = {
                                   "https://api.catboys.com/img"]),
     "catboy": ("котик ♡ ヽ(=^･ω･^=)丿", ["https://api.catboys.com/img",
                                         "https://nekos.best/api/v2/husbando"]),
+    "femboy": ("котик ♡ (⁄ ⁄•⁄ω⁄•⁄ ⁄)", ["https://api.catboys.com/img",
+                                          "https://nekos.best/api/v2/husbando"]),
 }
+# ── гифки-реакции ────────────────────────────────────────
+#  У nekos.best две разные ветки: четыре PNG-категории (neko, waifu,
+#  husbando, kitsune) и 59 GIF-реакций. Суффикса _gif в адресах нет и
+#  никогда не было — адрес всегда /api/v2/<категория>, а формат указан
+#  в /api/v2/endpoints. Оттуда взят список ниже; обновлять — там же.
+#  Важно: у neko/waifu/husbando/kitsune гифок не существует в принципе,
+#  это чисто картиночные категории.
+GIF_CATS = frozenset("""
+angry baka bite bleh blowkiss blush bonk bored carry clap confused cry
+cuddle dance facepalm feed handhold handshake happy highfive hug kabedon
+kick kiss lappillow laugh lurk nod nom nope nya pat peck poke pout punch
+run salute shake shocked shoot shrug sip slap sleep smile smug spin stare
+tableflip teehee think thumbsup tickle wag wave wink yawn yeet
+""".split())
+
+#  По-русски — чтобы не вспоминать английское название посреди разговора.
+GIF_RU = {
+    "обнять": "hug", "обнимашки": "hug", "прижать": "cuddle", "обнимать": "cuddle",
+    "погладить": "pat", "гладить": "pat", "поцелуй": "kiss", "чмок": "peck",
+    "воздушный": "blowkiss", "улыбка": "smile", "смех": "laugh", "ржу": "laugh",
+    "плак": "cry", "плакать": "cry", "злюсь": "angry", "бака": "baka",
+    "спать": "sleep", "зевок": "yawn", "танец": "dance", "танцевать": "dance",
+    "привет": "wave", "пока": "wave", "махать": "wave", "кивок": "nod",
+    "неа": "nope", "пять": "highfive", "заруку": "handhold", "класс": "thumbsup",
+    "бонк": "bonk", "шлёп": "slap", "шлеп": "slap", "пинок": "kick",
+    "кусь": "bite", "тык": "poke", "щекотка": "tickle", "краснеть": "blush",
+    "смущение": "blush", "думать": "think", "фейспалм": "facepalm",
+    "покормить": "feed", "ня": "nya", "подмигнуть": "wink", "пожать": "shrug",
+    "смотреть": "stare", "скучно": "bored", "колени": "lappillow",
+    "нести": "carry", "хлоп": "clap", "стол": "tableflip", "бежать": "run",
+    "пить": "sip", "кинуть": "yeet", "шок": "shocked", "ухмылка": "smug",
+    "дуться": "pout", "салют": "salute", "хихи": "teehee", "ням": "nom",
+    "хвост": "wag", "крутиться": "spin",
+}
+#  Для подписи берём первое русское имя категории, если оно есть.
+GIF_LABEL: dict[str, str] = {}
+for _word, _cat in GIF_RU.items():
+    GIF_LABEL.setdefault(_cat, _word)
+
+GIF_POPULAR = ("hug", "pat", "kiss", "nya", "dance", "laugh", "wave",
+               "sleep", "blush", "thumbsup", "baka", "bonk")
+
+
+def gif_sources(cat: str) -> list:
+    """Адрес гифки. Подменяется так же, как у картинок: NEKO_SRC_HUG=…"""
+    raw = os.getenv(f"NEKO_SRC_{cat.upper()}", "")
+    mine = [u.strip() for u in raw.split(",") if u.strip().startswith("http")]
+    return mine + [f"https://nekos.best/api/v2/{cat}"]
+
+
 NEKO_ALIAS = {                         # что можно написать после .nk
     "neko": "neko", "нэко": "neko", "неко": "neko", "ня": "neko",
     "kitsune": "kitsune", "лиса": "kitsune", "лисичка": "kitsune",
@@ -1266,7 +1320,23 @@ NEKO_ALIAS = {                         # что можно написать по
     "husbando": "husbando", "boy": "husbando", "b": "husbando",
     "м": "husbando", "кун": "husbando", "парень": "husbando",
     "catboy": "catboy", "кот": "catboy", "котик": "catboy", "некомими": "catboy",
+    "femboy": "femboy", "фембой": "femboy", "фем": "femboy", "fb": "femboy",
 }
+
+
+def sources_for(kind: str) -> list:
+    """Источники категории: сначала свои из окружения, потом встроенные.
+
+    Публичные API умирают и меняют владельца — waifu.pics из аниме-картинок
+    стал сайтом казино, — поэтому подменить источник можно, не трогая код:
+        NEKO_SRC_FEMBOY=https://свой-апи/random
+    Несколько адресов — через запятую, порядок и есть приоритет.
+    """
+    raw = os.getenv(f"NEKO_SRC_{kind.upper()}", "")
+    mine = [u.strip() for u in raw.split(",") if u.strip().startswith("http")]
+    return mine + list(NEKO[kind][1])
+
+
 MAX_PIC = 10 * 1024 * 1024             # потолок Telegram на фото
 IMG_MAGIC = ((b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"),
              (b"GIF8", "gif"), (b"RIFF", "webp"))
@@ -1377,8 +1447,13 @@ HELP = {
 
 <b>Картинки</b>
 <code>.nk</code> — неко · <code>.nkb</code> — кун
-<code>.nk лиса</code> <code>.nk вайфу</code> <code>.nk кот</code>
-<i>если источник лежит, бот сам идёт к следующему</i>"""),
+<code>.nk лиса</code> <code>.nk вайфу</code> <code>.nk кот</code> <code>.nk фембой</code>
+<i>если источник лежит, бот сам идёт к следующему</i>
+
+<b>Гифки-реакции</b> (59 штук)
+<code>.g обнять</code> <code>.g погладить</code> <code>.g поцелуй</code> <code>.g бонк</code>
+<code>.g</code> — случайная · <code>.g список</code> — все
+<i>ответом на сообщение гифка уходит ответом</i>"""),
 
     "fun": ("🎲", "Мелочи", """🎲 <b>Мелочи</b>
 
@@ -1744,11 +1819,11 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         if a and a not in NEKO_ALIAS:
             return await note("🐾 <code>.nk</code> — неко · <code>.nkb</code> — кун\n"
                               "Ещё: " + " ".join(f"<code>.nk {k}</code>" for k in
-                                                 ("лиса", "вайфу", "кот")))
+                                                 ("лиса", "вайфу", "кот", "фембой")))
         kind = NEKO_ALIAS.get(a) or ("husbando" if name == "nkb" else "neko")
-        cap, sources = NEKO[kind]
+        cap = NEKO[kind][0]
         await drop(m)
-        got = await fetch_pic(sources)
+        got = await fetch_pic(sources_for(kind))
         if not got:
             return await dm(uid, "😿 Источники картинок молчат — попробуй позже.")
         data, ext = got
@@ -1759,6 +1834,48 @@ async def handle_cmd(m: Message, uid: int, raw: str):
                          caption=cap, business_connection_id=cid)
         except Exception as ex:
             await dm(uid, f"⚠️ .{name}: {ex}")
+        return
+
+    #  Гифки-реакции: 59 штук, по-русски и по-английски.
+    #  Ответом на сообщение — уходит ответом же, так «обнять» достаётся
+    #  тому, кого обнимают, а не последнему в чате.
+    if name in ("nkg", "g", "гиф"):
+        a = args.strip().lower()
+        if a in ("список", "list", "?"):
+            return await note(
+                f"🎞 <b>Гифки-реакции</b> ({len(GIF_CATS)})\n\n"
+                "<b>По-русски:</b> " + ", ".join(sorted(GIF_LABEL.values())) +
+                "\n\n<b>Все названия:</b>\n<code>"
+                + " ".join(sorted(GIF_CATS)) + "</code>\n\n"
+                "Пример: <code>.g обнять</code> ответом на сообщение.")
+        cat = GIF_RU.get(a) or (a if a in GIF_CATS else None)
+        if a and not cat:
+            close = sorted(c for c in GIF_CATS if c.startswith(a[:3]))[:5]
+            tip = ("\n\nМожет быть: " + " ".join(f"<code>.g {c}</code>" for c in close)
+                   ) if close else ""
+            return await note(f"🤔 Нет реакции «{esc(a)}»{tip}\n\n"
+                              f"Весь список: <code>.g список</code>")
+        cat = cat or random.choice(GIF_POPULAR)
+        await drop(m)
+        got = await fetch_pic(gif_sources(cat))
+        if not got:
+            return await dm(uid, "😿 Гифки не отвечают — попробуй позже.")
+        data, ext = got
+        kw = {"caption": f"{GIF_LABEL.get(cat, cat)} ♡",
+              "business_connection_id": cid}
+        if rep:
+            kw["reply_parameters"] = ReplyParameters(message_id=rep.message_id)
+        try:
+            await bot.send_animation(m.chat.id,
+                                     BufferedInputFile(data, f"{cat}.{ext}"), **kw)
+        except Exception as ex:
+            #  Ответить не вышло (сообщение старое или удалено) — шлём просто так
+            kw.pop("reply_parameters", None)
+            try:
+                await bot.send_animation(m.chat.id,
+                                         BufferedInputFile(data, f"{cat}.{ext}"), **kw)
+            except Exception:
+                await dm(uid, f"⚠️ .{name}: {ex}")
         return
 
     if name in ("gif", "fv", "lq", "story"):
@@ -1848,7 +1965,8 @@ KNOWN_CMDS = sorted({
     "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
-    "nk", "nkb", "gif", "fv", "lq", "story", "pair", "unpair", "pairs",
+    "nk", "nkb", "nkg", "g", "гиф", "gif", "fv", "lq", "story",
+    "pair", "unpair", "pairs",
     "zalgo", "space", "upside", *MODES,
 })
 
