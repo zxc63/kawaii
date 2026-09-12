@@ -15,9 +15,14 @@
 Блоки:
   🛡 АНТИСКАМ — детект развода на первом контакте, уведомления
   🔪 ФИЛЬТР  — автоудаление подозрительных первых сообщений
-  🗑 АНТИ-ДЕЛИТ — сохраняет удалённые сообщения
-  🌸 МОДЫ — kawaii / tsundere / yandere / leet + совместный мод
+  🗑 АНТИ-ДЕЛИТ — сохраняет удалённые сообщения и правки
+  🌸 МОДЫ — kawaii / tsundere / yandere / leet / small / bubble / mock
+            + совместный мод и мод на конкретный диалог
+  🌙 ТИШИНА — уведомления беззвучно в заданные часы
+  💤 АВТООТВЕТ — «я отошёл» на первое сообщение
+  📬 СВОДКА — итоги дня одним сообщением
   🎬 МЕДИА — .gif .fv .lq .story .nk .type
+  🎲 МЕЛОЧИ — .pick .8ball .roll .zalgo .space …
   🛠 АДМИНКА — статистика, список юзеров, бан, рассылка
 
     pip install aiogram pillow aiohttp     (+ ffmpeg в системе)
@@ -128,11 +133,20 @@ USER_TPL = {
     "mode_level": "normal",    # soft | normal | max — сколько декора
     "mode_bold": True,         # выделять твой текст жирным
     "mode_emoji": True,        # добавлять эмодзи под настроение режима
+    "chat_modes": {},          # {chat_id: mode|"off"} — мод только для диалога
     "ref": 0,                  # кто пригласил (deep link)
+    "invited": 0,              # скольких привёл сам
     "save_media": True,        # архивировать медиа вообще
     "save_when": "deleted",    # deleted = только при удалении | always = сразу
     "track_edits": True,       # ловить правки чужих сообщений
     "save_own": False,         # архивировать и свои тоже
+    "sens": "normal",          # low | normal | high — строгость антискама
+    "muted": [],               # id собеседников без уведомлений
+    "trusted_ids": [],         # зеркало доверенных (для показа в меню)
+    "quiet": "",               # "23:00-08:00" — уведомления беззвучно
+    "away": "",                # текст автоответа, пусто = выключен
+    "away_on": False,
+    "digest": False,           # сводка за день в 21:00
     "antiscam": dict(ANTISCAM_TPL), "filter": dict(FILTER_TPL),
 }
 
@@ -170,13 +184,66 @@ def owner_by_cid(cid):
     return st.owner_by_cid(cid)
 
 
-async def dm(uid, text, **kw):
+def esc(t) -> str:
+    """Чужой текст перед вставкой в HTML. Без этого одна угловая скобка
+    в сообщении скамера роняет всё уведомление (Telegram не парсит)."""
+    return html_lib.escape(str(t or ""))
+
+
+async def call(fn, *a):
+    """Postgres-слой часть методов делает асинхронными, SQLite — нет.
+    Вызываем одинаково, не гадая."""
+    r = fn(*a)
+    return await r if asyncio.iscoroutine(r) else r
+
+
+def set_trust(uid, peer, on: bool):
+    """Доверие живёт в хранилище, но список для меню держим у юзера —
+    выбрать «всех доверенных» хранилище не умеет."""
+    st.set_trust(uid, peer, on)
+    u = user(uid)
+    lst = u.setdefault("trusted_ids", [])
+    if on and peer not in lst:
+        lst.append(peer)
+    elif not on and peer in lst:
+        lst.remove(peer)
+    save(uid)
+
+
+def hhmm(s: str):
+    h, m = s.strip().split(":")
+    h, m = int(h), int(m)
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(s)
+    return h * 60 + m
+
+
+def in_quiet(u) -> bool:
+    """Попадает ли текущее время в «тихие часы». Окно через полночь
+    (23:00-08:00) тоже считается правильно."""
+    q = (u.get("quiet") or "").strip()
+    if "-" not in q:
+        return False
+    try:
+        a, b = q.split("-", 1)
+        start, end = hhmm(a), hhmm(b)
+    except Exception:
+        return False
+    now = now_local()
+    cur = now.hour * 60 + now.minute
+    return start <= cur < end if start <= end else (cur >= start or cur < end)
+
+
+async def dm(uid, text, quiet_ok=True, **kw):
     c = conn_of(uid)
-    if c:
-        try:
-            return await bot.send_message(c["chat"], text, **kw)
-        except Exception:
-            pass
+    if not c:
+        return
+    if quiet_ok and in_quiet(user(uid)):
+        kw.setdefault("disable_notification", True)
+    try:
+        return await bot.send_message(c["chat"], text, **kw)
+    except Exception:
+        pass
 
 
 # ═════════════════════════════════════════════════════════
@@ -238,6 +305,11 @@ SCAM_RULES = [
                          r"одолж\w+|нужна\s+помощь\s+деньгами|карта\s*[:\-]?\s*\d{4})"),
     (1, "сумма денег", r"(\d{3,}\s*(руб|р\b|₽|\$|€|usd|дол)|\d+\s*(к|k)\s*(в|за)\s*(день|неделю|час))"),
     (1, "личка/переход", r"(пиши\s+в\s+лс|напиши\s+мне\s+в|переходи\s+в\s+бот|жми\s+сюда)"),
+    (3, "гарант/обмен", r"(через\s+гарант|я\s+гарант|обмен\s+с\s+гарант|сделка\s+через)"),
+    (3, "взлом близкого", r"(это\s+(мама|папа|сын|дочь|бабушк)\w*|"
+                          r"мой\s+номер\s+(не\s+работает|заблокир)|пишу\s+с\s+нового)"),
+    (2, "продажа аккаунта", r"(куплю\s+(акк|аккаунт|канал)|продам\s+(акк|аккаунт|канал)|"
+                            r"сдам\s+акк|аренда\s+аккаунт)"),
 ]
 EXEC_EXT = (".apk", ".exe", ".bat", ".cmd", ".scr", ".msi", ".jar",
             ".vbs", ".ps1", ".sh", ".com", ".dmg")
@@ -247,53 +319,58 @@ CARD_RE = re.compile(r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b")
 
 
 def analyze(m: Message, first_contact: bool) -> dict:
-    """Возвращает {'score':int, 'reasons':[str]} для входящего сообщения."""
+    """Возвращает {'score':int, 'reasons':[str], 'hits':[(вес,причина)]}."""
     text = (m.text or m.caption or "")
     low = normalize(text)              # ← очищенный текст для поиска слов
-    score, reasons = 0, []
+    score, hits = 0, []
+
+    def hit(weight: int, label: str):
+        nonlocal score
+        score += weight
+        hits.append((weight, label))
 
     if is_masked(text):
-        score += 1
-        reasons.append("маскировка символов")
+        hit(1, "маскировка символов")
 
     for weight, label, rx in SCAM_RULES:
         if re.search(rx, low):
-            score += weight
-            reasons.append(label)
+            hit(weight, label)
 
     if URL_RE.search(text):
-        score += 2 if first_contact else 1
-        reasons.append("ссылка")
+        hit(2 if first_contact else 1, "ссылка")
     if PHONE_RE.search(text):
-        score += 1
-        reasons.append("номер телефона")
+        hit(1, "номер телефона")
     if CARD_RE.search(text):
-        score += 3
-        reasons.append("номер карты")
+        hit(3, "номер карты")
     if m.reply_markup and getattr(m.reply_markup, "inline_keyboard", None):
-        score += 2
-        reasons.append("инлайн-кнопки")
+        hit(2, "инлайн-кнопки")
     if m.forward_origin is not None:
-        score += 1
-        reasons.append("переслано")
+        hit(1, "переслано")
     if m.document and m.document.file_name and \
             m.document.file_name.lower().endswith(EXEC_EXT):
-        score += 4
-        reasons.append(f"исполняемый файл ({m.document.file_name})")
+        hit(4, f"исполняемый файл ({m.document.file_name})")
     if m.from_user and m.from_user.is_bot:
-        score += 1
-        reasons.append("отправитель — бот")
+        hit(1, "отправитель — бот")
     if first_contact:
         score += 1
 
-    return {"score": score, "reasons": reasons, "text": text}
+    hits.sort(reverse=True)            # самое весомое — первым
+    return {"score": score, "reasons": [h[1] for h in hits],
+            "hits": hits, "text": text}
 
 
-SCAM_THRESHOLD = 4       # от скольки баллов считаем подозрительным
-#  ↑ ниже = строже (больше ложных), выше = мягче. Подкрути под себя.
+SCAM_THRESHOLD = 4       # порог по умолчанию: от скольки баллов подозрительно
+SENS = {"low": 6, "normal": 4, "high": 3}
+SENS_RU = {"low": "мягко", "normal": "обычно", "high": "строго"}
 
 
-def filter_hit(m: Message, f: dict, verdict: dict) -> str | None:
+def threshold(u: dict) -> int:
+    """Порог срабатывания под выбранную строгость.
+    Ниже = строже (больше ложных), выше = мягче."""
+    return SENS.get(u.get("sens", "normal"), SCAM_THRESHOLD)
+
+
+def filter_hit(m: Message, f: dict, verdict: dict, thr: int) -> str | None:
     """Правила «Тесака»: что именно поймали. None — чисто."""
     text = m.text or m.caption or ""
     if f["links"] and URL_RE.search(text):
@@ -307,9 +384,31 @@ def filter_hit(m: Message, f: dict, verdict: dict) -> str | None:
         for w in f["words"]:
             if w and normalize(w) in low:
                 return f"слово «{w}»"
-    if verdict["score"] >= SCAM_THRESHOLD:
+    if verdict["score"] >= thr:
         return "скам-детектор: " + ", ".join(verdict["reasons"][:3])
     return None
+
+
+#  Кому автоответ уже уходил: (владелец, собеседник) → когда.
+#  В памяти, а не в базе: перезапуск раз в сутки — это одно лишнее
+#  «я отошёл», и ради него отдельная таблица не нужна.
+away_sent: dict[tuple, float] = {}
+AWAY_COOLDOWN = 6 * 3600
+
+
+async def maybe_away(m: Message, owner_id: int, u: dict):
+    """Автоответ «меня нет» — один раз на собеседника раз в 6 часов."""
+    if not (u.get("away_on") and (u.get("away") or "").strip()):
+        return
+    key = (owner_id, m.chat.id)
+    if time.time() - away_sent.get(key, 0) < AWAY_COOLDOWN:
+        return
+    away_sent[key] = time.time()
+    try:
+        await bot.send_message(m.chat.id, esc(u["away"])[:800],
+                               business_connection_id=m.business_connection_id)
+    except Exception as ex:
+        logging.warning("away: %s", ex)
 
 
 async def guard_incoming(m: Message, owner_id: int):
@@ -318,33 +417,45 @@ async def guard_incoming(m: Message, owner_id: int):
     peer = m.chat.id
     a, f = u["antiscam"], u["filter"]
 
-    if st.is_trusted(owner_id, peer) or peer == owner_id:
+    if peer == owner_id:
+        return
+    if st.is_trusted(owner_id, peer):
         return
     first_contact = not st.is_known(owner_id, peer)
+
+    # заглушённый собеседник: диалог помним, но ни автоответа, ни тревог
+    if peer in (u.get("muted") or []):
+        if first_contact:
+            st.add_known(owner_id, peer)
+        return
+    await maybe_away(m, owner_id, u)
+
+    thr = threshold(u)
 
     # 1) уведомления
     if a["enabled"]:
         if first_contact and a["new_dialog"]:
-            who = m.from_user.full_name if m.from_user else "?"
-            un = f"@{m.from_user.username}" if (m.from_user and m.from_user.username) else "—"
+            who = esc(m.from_user.full_name if m.from_user else "?")
+            un = f"@{esc(m.from_user.username)}" if (m.from_user and m.from_user.username) else "—"
             await dm(owner_id,
                      f"💬 <b>Новый диалог</b>\n👤 {who} · {un} · <code>{peer}</code>",
-                     reply_markup=peer_kb(peer))
+                     reply_markup=peer_kb(peer, u))
         if a["unknown_bot"] and m.from_user and m.from_user.is_bot and first_contact:
             await dm(owner_id, f"🤖 <b>Незнакомый бот</b> написал тебе: "
-                               f"@{m.from_user.username or '?'} (<code>{peer}</code>)",
-                     reply_markup=peer_kb(peer))
+                               f"@{esc(m.from_user.username or '?')} (<code>{peer}</code>)",
+                     reply_markup=peer_kb(peer, u))
 
     verdict = analyze(m, first_contact)
 
     if a["enabled"] and a["exec_files"] and m.document and m.document.file_name \
             and m.document.file_name.lower().endswith(EXEC_EXT):
         await dm(owner_id, f"⚠️ <b>Исполняемый файл!</b>\n"
-                           f"<code>{m.document.file_name}</code> от <code>{peer}</code>\n"
-                           f"Не открывай это на телефоне.")
+                           f"<code>{esc(m.document.file_name)}</code> от <code>{peer}</code>\n"
+                           f"Не открывай это на телефоне.",
+                 quiet_ok=False)          # такое будит всегда
 
     # 2) фильтр / автоудаление
-    hit = filter_hit(m, f, verdict) if f["enabled"] and first_contact else None
+    hit = filter_hit(m, f, verdict, thr) if f["enabled"] and first_contact else None
     if hit:
         deleted = False
         if f["delete"]:
@@ -360,44 +471,66 @@ async def guard_incoming(m: Message, owner_id: int):
         st.log_catch(owner_id, peer, verdict["score"], hit, verdict["text"],
                      "deleted" if deleted else "notified")
         head = "🔪 <b>Сообщение удалено</b>" if deleted else "🔪 <b>Подозрительное сообщение</b>"
-        body = (verdict["text"][:600] or "(без текста)")
-        await dm(owner_id, f"{head}\n🎯 Причина: {hit}\n"
+        body = esc(verdict["text"][:600]) or "(без текста)"
+        await dm(owner_id, f"{head}\n🎯 Причина: {esc(hit)}\n"
                            f"👤 <code>{peer}</code>\n\n<blockquote>{body}</blockquote>",
-                 reply_markup=peer_kb(peer))
-    elif a["enabled"] and a["scam"] and verdict["score"] >= SCAM_THRESHOLD:
+                 reply_markup=peer_kb(peer, u))
+    elif a["enabled"] and a["scam"] and verdict["score"] >= thr:
         st.log_catch(owner_id, peer, verdict["score"],
                      ", ".join(verdict["reasons"][:3]), verdict["text"], "notified")
         await dm(owner_id,
-                 f"🚨 <b>Похоже на развод</b> ({verdict['score']} баллов)\n"
-                 f"🎯 {', '.join(verdict['reasons'][:4])}\n👤 <code>{peer}</code>\n\n"
-                 f"<blockquote>{verdict['text'][:600]}</blockquote>",
-                 reply_markup=peer_kb(peer))
+                 f"🚨 <b>Похоже на развод</b> · {risk_bar(verdict['score'], thr)}\n"
+                 f"🎯 {esc(', '.join(verdict['reasons'][:4]))}\n👤 <code>{peer}</code>\n\n"
+                 f"<blockquote>{esc(verdict['text'][:600])}</blockquote>",
+                 reply_markup=peer_kb(peer, u))
 
     # запоминаем диалог
     if first_contact:
         st.add_known(owner_id, peer)
 
 
-def peer_kb(peer) -> InlineKeyboardMarkup:
+def risk_bar(score: int, thr: int) -> str:
+    """Шкала риска вместо голого числа: видно, насколько перебрало порог."""
+    full = max(1, thr * 2)
+    n = max(0, min(5, round(score / full * 5)))
+    return f"{'▰' * n}{'▱' * (5 - n)} {score}/{thr}"
+
+
+def peer_kb(peer, u: dict | None = None) -> InlineKeyboardMarkup:
+    muted = bool(u and peer in (u.get("muted") or []))
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Доверять", callback_data=f"peer:white:{peer}"),
         InlineKeyboardButton(text="🚫 Не доверять", callback_data=f"peer:unwhite:{peer}"),
+    ], [
+        InlineKeyboardButton(text="🔔 Вернуть звук" if muted else "🔕 Заглушить",
+                             callback_data=f"peer:{'unmute' if muted else 'mute'}:{peer}"),
     ]])
 
 
 @dp.callback_query(F.data.startswith("peer:"))
 async def peer_cb(cb: CallbackQuery):
     _, act, peer = cb.data.split(":")
-    u = user(cb.from_user.id)
-    peer = int(peer)
+    uid, peer = cb.from_user.id, int(peer)
+    u = user(uid)
+    muted = u.setdefault("muted", [])
     if act == "white":
-        st.set_trust(cb.from_user.id, peer, True)
+        set_trust(uid, peer, True)
         await cb.answer("Добавлен в доверенные ✅")
-    else:
-        st.set_trust(cb.from_user.id, peer, False)
+    elif act == "unwhite":
+        set_trust(uid, peer, False)
         await cb.answer("Убран из доверенных")
+    elif act == "mute":
+        if peer not in muted:
+            muted.append(peer)
+        save(uid)
+        await cb.answer("Уведомления о нём выключены 🔕")
+    else:
+        if peer in muted:
+            muted.remove(peer)
+        save(uid)
+        await cb.answer("Уведомления включены 🔔")
     try:
-        await cb.message.edit_reply_markup(reply_markup=peer_kb(peer))
+        await cb.message.edit_reply_markup(reply_markup=peer_kb(peer, u))
     except Exception:
         pass
 
@@ -563,7 +696,85 @@ def leet(t: str, level="normal", bold=False, emoji=True) -> str:
     return out
 
 
-MODES = {"kawaii": kawaii, "tsundere": tsundere, "yandere": yandere, "leet": leet}
+# ─────────────────────────────────────────────────────────
+#  ТИПОГРАФИКА — чистые подмены символов, без болтовни
+# ─────────────────────────────────────────────────────────
+#  Юникод, а не разметка: работает и в заголовках, и в никах,
+#  и там, где Telegram форматирование не рисует.
+SMALLCAPS = str.maketrans(
+    "abcdefghijklmnopqrstuvwxyz",
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘQʀꜱᴛᴜᴠᴡxʏᴢ")
+FLIP = str.maketrans(
+    "abcdefghijklmnopqrstuvwxyz0123456789.,!?'\"()[]{}<>",
+    "ɐqɔpǝɟƃɥᴉɾʞlɯuodbɹsʇnʌʍxʎz0ƖᄅƐㄣϛ9ㄥ86˙'¡¿,„)(][}{><")
+
+
+def smallcaps(t: str, level="normal", bold=False, emoji=True) -> str:
+    return t.lower().translate(SMALLCAPS)
+
+
+def bubble(t: str, level="normal", bold=False, emoji=True) -> str:
+    out = []
+    for ch in t:
+        if "a" <= ch.lower() <= "z":
+            out.append(chr(0x24B6 + ord(ch.lower()) - 97))
+        elif ch.isdigit() and ch != "0":
+            out.append(chr(0x2460 + int(ch) - 1))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def mock(t: str, level="normal", bold=False, emoji=True) -> str:
+    """sPoNgEbOb — регистр скачет, но не строго через букву,
+    иначе читается как машинный, а не как издёвка."""
+    out, up = [], False
+    for ch in t:
+        if ch.isalpha():
+            out.append(ch.upper() if up else ch.lower())
+            up = not up if maybe(0.8) else up
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def spaced(t: str) -> str:
+    return " ".join(t)
+
+
+def zalgo(t: str, power=3) -> str:
+    marks = [chr(c) for c in range(0x0300, 0x036F)]
+    return "".join(ch + "".join(random.choice(marks) for _ in range(random.randint(0, power)))
+                   for ch in t)
+
+
+def upside(t: str) -> str:
+    return t.lower().translate(FLIP)[::-1]
+
+
+MODES = {"kawaii": kawaii, "tsundere": tsundere, "yandere": yandere, "leet": leet,
+         "small": smallcaps, "bubble": bubble, "mock": mock}
+MODE_UI = {                                  # подпись и иконка для меню
+    "kawaii": ("🌸", "kawaii", "ня~ и сердечки"),
+    "tsundere": ("💢", "tsundere", "б-бака!"),
+    "yandere": ("🔪", "yandere", "ты только мой"),
+    "leet": ("👾", "leet", "h4ck3r"),
+    #  ↓ у кириллицы нет ни капсов, ни кружочков в юникоде —
+    #    эти два работают только на латинице, так и пишем
+    "small": ("🔡", "small", "ᴀʙᴄ · латиница"),
+    "bubble": ("🫧", "bubble", "ⒶⒷⒸ · латиница"),
+    "mock": ("🐔", "mock", "sPoNgEbOb"),
+}
+PREVIEW_SRC = "привет, как дела? я сегодня освободился пораньше"
+
+
+def preview(mode: str, u: dict) -> str:
+    """Как будет выглядеть твоя фраза в выбранном стиле."""
+    fn = MODES.get(mode or "")
+    if not fn:
+        return f"<i>{esc(PREVIEW_SRC)}</i>\n\n<i>(мод выключен — текст уходит как есть)</i>"
+    return fn(esc(PREVIEW_SRC), u.get("mode_level", "normal"),
+              u.get("mode_bold", True), u.get("mode_emoji", True))
 RU = "йцукенгшщзхъфывапролджэячсмитьбю."
 EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,./"
 
@@ -653,7 +864,8 @@ async def on_deleted(ev: BusinessMessagesDeleted):
         if not info:
             continue
         head = (f"🗑 <b>Удалённое сообщение</b>\n"
-                f"👤 {info['from']} (<code>{info['from_id']}</code>)")
+                f"👤 {esc(info['from'])} (<code>{info['from_id']}</code>) · "
+                f"{ts_local(info['date']):%d.%m %H:%M}")
         try:
             if info["media"]:
                 u = user(owner_id)
@@ -668,7 +880,10 @@ async def on_deleted(ev: BusinessMessagesDeleted):
                     except Exception:
                         pass
             await bot.send_message(c["chat"], head + (
-                f"\n\n💬 {info['text']}" if info["text"] else "\n\n📎 (медиа)"))
+                f"\n\n<blockquote>{esc(info['text'][:900])}</blockquote>"
+                if info["text"] else "\n\n📎 (медиа)"),
+                reply_markup=peer_kb(info["from_id"], user(owner_id))
+                if info["from_id"] else None)
         except Exception as ex:
             logging.warning("antidelete: %s", ex)
 
@@ -723,10 +938,10 @@ async def archive_media(m: Message, owner_id: int, forced=False) -> str | None:
     if not who:
         who = getattr(m.chat, "full_name", None) or getattr(m.chat, "title", None) \
             or f"id {m.chat.id}"
-    cap = (f"📦 <b>{kind}</b> · {who}\n"
+    cap = (f"📦 <b>{kind}</b> · {esc(who)}\n"
            f"💬 чат <code>{m.chat.id}</code> · {now_local():%d.%m %H:%M}")
     if m.caption:
-        cap += f"\n\n{m.caption[:300]}"
+        cap += f"\n\n{esc(m.caption[:300])}"
 
     saved_id, note = 0, ""
     try:
@@ -785,7 +1000,7 @@ async def archive_from_cache(info: dict, owner_id: int) -> str:
                   "animation": bot.send_animation, "audio": bot.send_audio,
                   "sticker": bot.send_sticker}.get(kind, bot.send_document)
         cap = (f"🗑📦 <b>{kind}</b> из удалённого\n"
-               f"👤 {info['from']} · {now_local():%d.%m %H:%M}")
+               f"👤 {esc(info['from'])} · {now_local():%d.%m %H:%M}")
         kw = {"caption": cap} if kind not in ("video_note", "sticker") else {}
         msg = await sender(c["chat"], file, **kw)
         st.log_media(owner_id, info["chat"], info["from_id"], kind, file_id,
@@ -847,7 +1062,7 @@ async def on_edited(m: Message):
     if old_text == new_text:          # правка медиа/разметки без текста
         return
 
-    who = m.from_user.full_name if m.from_user else "?"
+    who = esc(m.from_user.full_name if m.from_user else "?")
     await bot.send_message(
         c["chat"],
         f"✏️ <b>Сообщение изменено</b> · <i>{diff_line(old_text, new_text)}</i>\n"
@@ -885,15 +1100,32 @@ async def on_business_message(m: Message):
     text = m.text or ""
     if text.startswith(PREFIX):
         u["cmds"] += 1
-        save()
+        save(owner_id)
         return await handle_cmd(m, owner_id, text[len(PREFIX):])
 
-    mode = u["pairs"].get(str(m.chat.id)) or u["mode"]
+    mode = mode_for(u, m.chat.id)
     if mode and mode in MODES and text.strip():
         await replace_with(m, MODES[mode](html_lib.escape(text),
                                           u.get("mode_level", "normal"),
                                           u.get("mode_bold", True),
                                           u.get("mode_emoji", True)))
+
+
+def mode_for(u: dict, chat_id) -> str | None:
+    """Какой мод применить в этом диалоге.
+
+    Порядок: совместный мод (вы договорились с собеседником) →
+    мод, назначенный этому чату через .here → общий мод.
+    «off» у чата глушит общий мод только здесь.
+    """
+    key = str(chat_id)
+    pair = u["pairs"].get(key)
+    if pair:
+        return pair
+    local = (u.get("chat_modes") or {}).get(key)
+    if local == "off":
+        return None
+    return local or u["mode"]
 
 
 async def drop(m: Message) -> bool:
@@ -991,37 +1223,85 @@ def to_stories(data: bytes):
 # ═════════════════════════════════════════════════════════
 #  КОМАНДЫ
 # ═════════════════════════════════════════════════════════
-CMD_HELP = """✨ <b>Команды</b> (префикс <code>.</code>)
+#  Справка разбита по темам: одним полотном её никто не читает,
+#  а кнопки внизу дают пролистать ровно нужный кусок.
+HELP = {
+    "guard": ("🛡", "Защита", """🛡 <b>Защита</b>
 
-<b>Защита</b>
-<code>.scam</code> — вкл/выкл антискам
-<code>.filter</code> — вкл/выкл фильтр первых сообщений
-<code>.trust</code> — доверять этому собеседнику (ответом или в его чате)
-<code>.check</code> — проверить сообщение вручную (ответом)
-<code>.word +слово</code> / <code>.word -слово</code> — стоп-слова
-<code>/log</code> — журнал срабатываний
+<code>.scam</code> — антискам вкл/выкл
+<code>.filter</code> — фильтр первых сообщений вкл/выкл
+<code>.sens мягко|обычно|строго</code> — строгость детектора
+<code>.check</code> — разобрать сообщение по баллам (ответом)
+<code>.trust</code> / <code>.untrust</code> — доверять собеседнику или нет
+<code>.mute</code> / <code>.unmute</code> — уведомления по этому диалогу
+<code>.word +слово</code> · <code>.word -слово</code> — стоп-слова
+<code>.away текст</code> · <code>.away off</code> — автоответ «я отошёл»
+<code>.quiet 23:00-08:00</code> · <code>.quiet off</code> — тихие часы
+<code>/log</code> — журнал срабатываний"""),
 
-<b>Моды</b>
-<code>.mode kawaii|tsundere|yandere|leet|off</code>
-<code>.kawaii</code> <code>.tsundere</code> <code>.yandere</code> <code>.leet</code>
+    "style": ("🎨", "Стиль", """🎨 <b>Стиль речи</b>
+
+<code>.mode</code> <i>kawaii tsundere yandere leet small bubble mock</i> | <code>off</code>
+<code>.here kawaii</code> — мод только для этого диалога
+<code>.here off</code> — здесь писать без мода
 <code>.style soft|normal|max</code> — сколько декора
 <code>.style bold</code> · <code>.style emoji</code>
-<code>.pair kawaii</code> · <code>.unpair</code> · <code>.pairs</code>
+<code>.preview</code> — как это будет выглядеть
+<code>.pair kawaii</code> · <code>.unpair</code> · <code>.pairs</code> — вдвоём
 
-<b>Архив медиа</b> 📦
+Разово, не меняя режим:
+<code>.kawaii текст</code> <code>.mock текст</code> <code>.small</code> <code>.bubble</code>
+<code>.zalgo</code> <code>.space</code> <code>.upside</code> <code>.sw</code> (раскладка)
+
+<i>small и bubble меняют только латинские буквы — в юникоде
+нет ни кириллических капсов, ни кириллицы в кружочках.</i>"""),
+
+    "arch": ("📦", "Архив", """📦 <b>Архив и следы</b>
+
 <code>.save</code> — сохранить медиа (ответом)
 <code>.savemedia</code> — архив вкл/выкл
 <code>.savewhen always|deleted</code> — когда сохранять
+<code>.ad</code> — анти-делит (удалённые сообщения)
 <code>.edits</code> — ловить правки чужих сообщений
-<code>.media</code> — что в архиве
+<code>.media</code> — что лежит в архиве
+<code>.digest</code> — сводка за день в 21:00
+<code>.export</code> — выгрузить настройки и журнал файлом"""),
 
-<b>Медиа</b> (ответом)
-<code>.gif</code> <code>.fv</code> <code>.lq</code> <code>.story</code> <code>.nk</code>
+    "media": ("🎬", "Медиа", """🎬 <b>Работа с медиа</b> (ответом на сообщение)
 
-<b>Прочее</b>
-<code>/invite</code> — позвать друга · <code>/setup</code> — инструкция
-<code>.type</code> <code>.sw</code> <code>.flip</code> <code>.dice</code> <code>.love</code> <code>.ad</code> <code>.me</code>
-"""
+<code>.gif</code> — видео → гифка
+<code>.fv</code> — голосовое громче и чище
+<code>.lq</code> — зашакалить фото
+<code>.story</code> — фото → нарезка под сторис
+<code>.nk</code> — случайная неко-картинка
+<code>.type</code> — печатать текст по буквам"""),
+
+    "fun": ("🎲", "Мелочи", """🎲 <b>Мелочи</b>
+
+<code>.pick а | б | в</code> — выбрать за тебя
+<code>.roll 2d6</code> · <code>.dice</code> · <code>.flip</code>
+<code>.8ball вопрос</code> — шар предсказаний
+<code>.love</code> · <code>.me</code> — про себя
+<code>/invite</code> — позвать друга · <code>/setup</code> — как подключить"""),
+}
+CMD_HELP = ("✨ <b>Команды</b> · префикс <code>.</code>\n\n"
+            "Пишешь их <b>сам, в любом диалоге</b> — бот стирает команду\n"
+            "и делает своё. Выбери раздел 👇")
+
+
+def help_kb(active: str = "") -> InlineKeyboardMarkup:
+    rows, line = [], []
+    for k, (ico, title, _) in HELP.items():
+        mark = "· " if k == active else ""
+        line.append(InlineKeyboardButton(text=f"{mark}{ico} {title}",
+                                         callback_data=f"h:{k}"))
+        if len(line) == 2:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append([InlineKeyboardButton(text="‹ Меню", callback_data="n:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def handle_cmd(m: Message, uid: int, raw: str):
@@ -1043,29 +1323,100 @@ async def handle_cmd(m: Message, uid: int, raw: str):
     # ── защита ──
     if name == "scam":
         u["antiscam"]["enabled"] = not u["antiscam"]["enabled"]
-        save()
+        save(uid)
         return await note(f"🛡 Антискам: {'вкл ✅' if u['antiscam']['enabled'] else 'выкл ❌'}")
 
     if name == "filter":
         u["filter"]["enabled"] = not u["filter"]["enabled"]
-        save()
+        save(uid)
         return await note(f"🔪 Фильтр: {'вкл ✅' if u['filter']['enabled'] else 'выкл ❌'}\n"
                           f"Удаление: {'да' if u['filter']['delete'] else 'нет (только уведомления)'}")
 
-    if name == "trust":
+    if name == "sens":
+        a = args.strip().lower()
+        aliases = {"мягко": "low", "обычно": "normal", "строго": "high"}
+        a = aliases.get(a, a)
+        if a not in SENS:
+            return await note(
+                "🎚 <code>.sens мягко|обычно|строго</code>\n\n"
+                f"Сейчас: <b>{SENS_RU[u.get('sens','normal')]}</b> "
+                f"(порог {threshold(u)} баллов)\n\n"
+                "<i>Строже — ловит больше, но чаще ошибается на живых людях.</i>")
+        u["sens"] = a
+        save(uid)
+        return await note(f"🎚 Строгость: <b>{SENS_RU[a]}</b> · порог {SENS[a]}")
+
+    if name in ("trust", "untrust"):
         target = rep.from_user.id if (rep and rep.from_user) else peer
-        st.set_trust(uid, target, True)
-        return await note(f"✅ <code>{target}</code> в доверенных — проверки для него отключены.")
+        on = name == "trust"
+        set_trust(uid, target, on)
+        return await note(f"✅ <code>{target}</code> в доверенных — проверки отключены."
+                          if on else f"↩️ <code>{target}</code> убран из доверенных.")
+
+    if name in ("mute", "unmute"):
+        target = rep.from_user.id if (rep and rep.from_user) else peer
+        muted = u.setdefault("muted", [])
+        if name == "mute" and target not in muted:
+            muted.append(target)
+        elif name == "unmute" and target in muted:
+            muted.remove(target)
+        save(uid)
+        return await note(f"🔕 <code>{target}</code> без уведомлений." if name == "mute"
+                          else f"🔔 <code>{target}</code> снова с уведомлениями.")
 
     if name == "check":
         if not rep:
             return await note("↩️ Ответь на сообщение, которое проверить.")
-        v = analyze(rep, rep.chat.id not in u["known"])
-        verdict = ("🚨 похоже на развод" if v["score"] >= SCAM_THRESHOLD
-                   else "🟡 есть признаки" if v["score"] >= 3 else "🟢 чисто")
+        thr = threshold(u)
+        v = analyze(rep, not st.is_known(uid, rep.chat.id))
+        verdict = ("🚨 похоже на развод" if v["score"] >= thr
+                   else "🟡 есть признаки" if v["score"] >= thr - 1 else "🟢 чисто")
+        rows = "\n".join(f"  +{w} · {esc(lbl)}" for w, lbl in v["hits"][:8]) or "  — ничего"
         return await note(f"🔎 <b>Проверка</b>: {verdict}\n"
-                          f"Баллы: <b>{v['score']}</b> (порог {SCAM_THRESHOLD})\n"
-                          f"Признаки: {', '.join(v['reasons']) or '—'}")
+                          f"{risk_bar(v['score'], thr)} · строгость {SENS_RU[u.get('sens','normal')]}\n\n"
+                          f"<b>Из чего сложилось:</b>\n{rows}")
+
+    if name == "away":
+        a = args.strip()
+        if a.lower() in ("off", "выкл", "стоп"):
+            u["away_on"] = False
+            save(uid)
+            return await note("💤 Автоответ выключен.")
+        if not a:
+            u["away_on"] = bool(u.get("away")) and not u.get("away_on")
+            save(uid)
+            if not u.get("away"):
+                return await note("💤 <code>.away текст</code> — что отвечать, пока тебя нет.")
+            return await note(f"💤 Автоответ: {'вкл ✅' if u['away_on'] else 'выкл ❌'}\n"
+                              f"<blockquote>{esc(u['away'])}</blockquote>")
+        u["away"], u["away_on"] = a[:800], True
+        save(uid)
+        return await note(f"💤 Автоответ включён — уйдёт один раз на собеседника "
+                          f"(не чаще раза в 6 ч):\n<blockquote>{esc(a[:800])}</blockquote>")
+
+    if name == "quiet":
+        a = args.strip().lower()
+        if a in ("off", "выкл", ""):
+            if not a and u.get("quiet"):
+                return await note(f"🌙 Тихие часы: <b>{esc(u['quiet'])}</b>\n"
+                                  f"Выключить: <code>.quiet off</code>")
+            u["quiet"] = ""
+            save(uid)
+            return await note("🌙 Тихие часы выключены — уведомления снова со звуком.")
+        try:
+            s, e = a.split("-", 1)
+            hhmm(s), hhmm(e)
+        except Exception:
+            return await note("🌙 Формат: <code>.quiet 23:00-08:00</code>")
+        u["quiet"] = f"{s.strip()}-{e.strip()}"
+        save(uid)
+        return await note(f"🌙 С {esc(s.strip())} до {esc(e.strip())} уведомления "
+                          f"приходят беззвучно.\n<i>Исполняемые файлы будят всегда.</i>")
+
+    if name == "digest":
+        u["digest"] = not u.get("digest")
+        save(uid)
+        return await note(f"📬 Сводка за день: {'вкл ✅ (в 21:00)' if u['digest'] else 'выкл ❌'}")
 
     if name == "word":
         a = args.strip()
@@ -1078,40 +1429,65 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             if w and w not in u["filter"]["words"]:
                 u["filter"]["words"].append(w)
                 u["filter"]["words_on"] = True
-                save()
-            return await note(f"➕ Добавлено: «{w}»")
+                save(uid)
+            return await note(f"➕ Добавлено: «{esc(w)}»")
         if a.startswith("-"):
             w = a[1:].strip().lower()
             if w in u["filter"]["words"]:
                 u["filter"]["words"].remove(w)
-                save()
-            return await note(f"➖ Удалено: «{w}»")
+                save(uid)
+            return await note(f"➖ Удалено: «{esc(w)}»")
         return await note("Использование: <code>.word +слово</code> / <code>.word -слово</code>")
 
     # ── инфо ──
     if name in ("help", "h"):
-        return await note(CMD_HELP)
+        return await note(CMD_HELP, reply_markup=help_kb())
     if name == "me":
-        return await note(
-            f"👤 <b>{u['name']}</b>\n"
-            f"🛡 Антискам: {'вкл' if u['antiscam']['enabled'] else 'выкл'}\n"
-            f"🔪 Фильтр: {'вкл' if u['filter']['enabled'] else 'выкл'} · поймано: <b>{u['caught']}</b>\n"
-            f"🗑 Анти-делит: {'вкл' if u['antidelete'] else 'выкл'}\n"
-            f"🌸 Мод: <b>{u['mode'] or 'выкл'}</b> · 🤝 пар: {len(u['pairs'])}\n"
-            f"✅ Доверенных: {st.counts(uid)[1]} · 💬 диалогов: {st.counts(uid)[0]}")
+        await drop(m)
+        txt, kb = await screen(uid, "stats")
+        return await dm(uid, txt, reply_markup=kb)
+    if name in ("menu", "settings"):
+        await drop(m)
+        txt, kb = await screen(uid, "root")
+        return await dm(uid, txt, reply_markup=kb)
 
     # ── моды ──
     if name == "mode":
         a = args.strip().lower()
         if a in ("off", "", "none"):
             u["mode"] = None
-            save()
+            save(uid)
             return await note("🔕 Мод выключен.")
         if a not in MODES:
             return await note("⚠️ Моды: " + ", ".join(MODES))
         u["mode"] = a
-        save()
-        return await note(f"✅ Мод: <b>{a}</b> ♡")
+        save(uid)
+        return await note(f"✅ Мод: <b>{a}</b> ♡\n\n{preview(a, u)}")
+
+    if name == "here":
+        a = args.strip().lower()
+        cm = u.setdefault("chat_modes", {})
+        if a in ("clear", "сброс"):
+            cm.pop(str(peer), None)
+            save(uid)
+            return await note("↩️ В этом диалоге снова общий мод.")
+        if a in ("off", "выкл"):
+            cm[str(peer)] = "off"
+            save(uid)
+            return await note("🔕 В этом диалоге пишем без мода.")
+        if a not in MODES:
+            return await note("🎯 <code>.here kawaii|…</code> — мод только здесь\n"
+                              "<code>.here off</code> — здесь без мода\n"
+                              "<code>.here clear</code> — вернуть общий\n\n"
+                              "Моды: " + ", ".join(MODES))
+        cm[str(peer)] = a
+        save(uid)
+        return await note(f"🎯 В этом диалоге мод <b>{a}</b>.\n\n{preview(a, u)}")
+
+    if name == "preview":
+        a = args.strip().lower()
+        mode = a if a in MODES else mode_for(u, peer)
+        return await note(f"👁 <b>Предпросмотр</b> · {mode or 'без мода'}\n\n{preview(mode, u)}")
 
     if name == "style":
         a = args.strip().lower()
@@ -1141,34 +1517,71 @@ async def handle_cmd(m: Message, uid: int, raw: str):
                                      u.get("mode_level", "normal"),
                                      u.get("mode_bold", True),
                                      u.get("mode_emoji", True)))
+    if name in ("zalgo", "space", "upside"):
+        src = args or (rep.text if rep and rep.text else "")
+        if not src.strip():
+            return await note(f"✍️ <code>.{name} текст</code> или ответом на сообщение.")
+        fn = {"zalgo": zalgo, "space": spaced, "upside": upside}[name]
+        return await out(html_lib.escape(fn(src[:500])))
     if name == "sw":
         return await out(switch_layout(args or (rep.text if rep else "")))
     if name == "flip":
         return await out("🪙 " + random.choice(["Орёл", "Решка"]))
     if name == "dice":
         return await out(f"🎲 {random.randint(1, 6)}")
+
+    if name == "roll":
+        mt = re.fullmatch(r"\s*(\d{0,2})d(\d{1,3})\s*", args.lower() or "1d6")
+        if not mt:
+            return await note("🎲 <code>.roll 2d6</code> — два кубика по шесть граней.")
+        n, side = max(1, int(mt.group(1) or 1)), max(2, int(mt.group(2)))
+        if n > 20:
+            n = 20
+        rolls = [random.randint(1, side) for _ in range(n)]
+        tail = f" = <b>{sum(rolls)}</b>" if n > 1 else ""
+        return await out(f"🎲 {' + '.join(map(str, rolls))}{tail}")
+
+    if name == "pick":
+        opts = [o.strip() for o in re.split(r"[|,;]| или ", args) if o.strip()]
+        if len(opts) < 2:
+            return await note("🎯 <code>.pick кофе | чай | ничего</code>")
+        return await out(f"🎯 <b>{html_lib.escape(random.choice(opts))}</b>")
+
+    if name in ("8ball", "8"):
+        answers = ["бесспорно", "мне кажется — да", "определённо да", "скорее всего",
+                   "хороший знак", "спроси позже", "не сейчас", "туманно",
+                   "даже не думай", "мой ответ — нет", "весьма сомнительно",
+                   "перспективы не очень"]
+        q = f"<i>{html_lib.escape(args.strip())}</i>\n" if args.strip() else ""
+        return await out(f"{q}🎱 {random.choice(answers)}")
+
     if name == "love":
         return await out(" ".join(random.sample("❤️🧡💛💚💙💜🤍💗", 8)))
     if name == "ad":
         u["antidelete"] = not u["antidelete"]
-        save()
+        save(uid)
         return await note(f"🗑 Анти-делит: {'вкл ✅' if u['antidelete'] else 'выкл ❌'}")
 
     if name == "type":
-        txt = args or "..."
+        #  Одна правка на символ упирается в лимиты Telegram на длинном
+        #  тексте: чем длиннее, тем крупнее шаг — эффект тот же, правок меньше.
+        txt = (args or "...")[:400]
+        step = 1 if len(txt) <= 60 else 2 if len(txt) <= 160 else 4
         await drop(m)
         try:
             sent = await bot.send_message(m.chat.id, "▌", business_connection_id=cid)
             acc = ""
-            for ch in txt:
-                acc += ch
+            for i in range(0, len(txt), step):
+                acc = txt[:i + step]
                 try:
-                    await bot.edit_message_text(acc + "▌", chat_id=m.chat.id,
+                    await bot.edit_message_text(html_lib.escape(acc) + "▌",
+                                                chat_id=m.chat.id,
                                                 message_id=sent.message_id,
                                                 business_connection_id=cid)
                 except Exception:
                     pass
-                await asyncio.sleep(0.07)
+                await asyncio.sleep(0.09)
+            acc = txt
             await bot.edit_message_text(acc, chat_id=m.chat.id,
                                         message_id=sent.message_id,
                                         business_connection_id=cid)
@@ -1211,24 +1624,13 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         return await note(f"📦 Архив медиа: {'вкл ✅' if u['save_media'] else 'выкл ❌'}")
 
     if name == "media":
-        def plural(n, forms=("файл", "файла", "файлов")):
-            n10, n100 = n % 10, n % 100
-            if n10 == 1 and n100 != 11:
-                return forms[0]
-            if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
-                return forms[1]
-            return forms[2]
+        await drop(m)
+        txt, kb = await screen(uid, "arch")
+        return await dm(uid, txt, reply_markup=kb)
 
-        n, sz = st.media_stats(uid) if not asyncio.iscoroutinefunction(st.media_stats) \
-            else await st.media_stats(uid)
-        rows = st.recent_media(uid, 5) if not asyncio.iscoroutinefunction(st.recent_media) \
-            else await st.recent_media(uid, 5)
-        lines = [f"• {r['kind']} от <code>{r['sender']}</code> · "
-                 f"{ts_local(r['ts']):%d.%m %H:%M}" for r in rows]
-        vol = (f"{sz/1048576:.1f} МБ" if sz >= 1048576
-               else f"{sz/1024:.0f} КБ" if sz else "размер неизвестен")
-        return await note(f"📦 <b>Архив</b>: {n} {plural(n)}, {vol}\n\n"
-                          + ("\n".join(lines) or "пусто"))
+    if name == "export":
+        await drop(m)
+        return await send_export(uid)
 
     # ── медиа ──
     if name == "nk":
@@ -1307,8 +1709,9 @@ async def handle_cmd(m: Message, uid: int, raw: str):
     if name == "unpair":
         had = u["pairs"].pop(str(peer), None)
         if user(peer)["pairs"].pop(str(uid), None):
+            save(peer)
             await dm(peer, "👋 Собеседник выключил совместный мод.")
-        save()
+        save(uid)
         return await note("👋 Выключено." if had else "🤷 Пары не было.")
 
     if name == "pairs":
@@ -1316,6 +1719,24 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             return await note("📭 Пар нет.")
         return await note("🤝 <b>Пары:</b>\n" + "\n".join(
             f"• <code>{k}</code> — <b>{v}</b>" for k, v in u["pairs"].items()))
+
+    # ── команды нет ──
+    #  Молчать нельзя: команда уже улетела собеседнику как обычный текст,
+    #  и человек должен понять, почему ничего не произошло.
+    close = [c for c in KNOWN_CMDS if c.startswith(name[:3])][:4] if len(name) > 2 else []
+    tip = ("\n\nМожет быть: " + " ".join(f"<code>.{c}</code>" for c in close)) if close else ""
+    return await note(f"🤔 Не знаю команду <code>.{esc(name)}</code>{tip}",
+                      reply_markup=help_kb())
+
+
+KNOWN_CMDS = sorted({
+    "scam", "filter", "sens", "trust", "untrust", "mute", "unmute", "check",
+    "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
+    "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
+    "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
+    "nk", "gif", "fv", "lq", "story", "pair", "unpair", "pairs",
+    "zalgo", "space", "upside", *MODES,
+})
 
 
 @dp.callback_query(F.data.startswith("pair:"))
@@ -1328,7 +1749,8 @@ async def on_pair(cb: CallbackQuery):
         return await cb.answer()
     user(responder)["pairs"][str(initiator)] = mode
     user(initiator)["pairs"][str(responder)] = mode
-    save()
+    save(responder)
+    save(initiator)
     await cb.message.edit_text(f"🤝 Совместный мод <b>{mode}</b> включён ♡")
     await dm(initiator, f"✅ Согласие получено! Мод <b>{mode}</b> активен ♡")
     await cb.answer("Готово!")
@@ -1372,13 +1794,6 @@ Premium для этого <b>не нужен</b>.
 Как закончишь — жми «Проверить» ниже 👇"""
 
 
-def setup_kb(username) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Проверить подключение", callback_data="m:check")],
-        [InlineKeyboardButton(text="❓ Не получается", callback_data="m:trouble")],
-    ])
-
-
 TROUBLE = """🔧 <b>Если не выходит</b>
 
 <b>Бота нет в списке чат-ботов</b>
@@ -1410,141 +1825,494 @@ TROUBLE = """🔧 <b>Если не выходит</b>
 
 
 # ═════════════════════════════════════════════════════════
-#  МЕНЮ
+#  МЕНЮ · единая навигация
 # ═════════════════════════════════════════════════════════
+#  Один экран — одна ветка в screen(), она отдаёт (текст, клавиатуру).
+#  Кнопки знают всего три глагола, и этого хватает на всё меню:
+#     n:<экран>[:<арг>]            — перейти
+#     t:<путь>[:<экран>]           — переключить галочку и перерисовать
+#     v:<путь>:<значение>[:<экран>] — выбрать одно значение из нескольких
+#  Путь — либо ключ юзера ("save_media"), либо вложенный
+#  ("antiscam.enabled"). Новый переключатель = одна строка в клавиатуре.
 def dot(x):
     return "🟢" if x else "🔴"
 
 
-def main_kb(uid) -> InlineKeyboardMarkup:
-    u = user(uid)
+def chk(x):
+    return "☑️" if x else "▫️"
+
+
+def pill(on):
+    return "◉" if on else "◯"
+
+
+def B(text, data) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def dig(u: dict, path: str):
+    node = u
+    for part in path.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
+def dig_set(u: dict, path: str, val):
+    parts = path.split(".")
+    node = u
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = val
+
+
+def toggles(u, screen_id, items) -> list:
+    """[(путь, подпись)] → строки клавиатуры с галочками."""
+    return [[B(f"{chk(dig(u, p))} {lbl}", f"t:{p}:{screen_id}")] for p, lbl in items]
+
+
+def choice(u, path, screen_id, options) -> list:
+    """Один ряд-переключатель: [(значение, подпись)] с отметкой текущего."""
+    cur = dig(u, path)
+    return [[B(f"{pill(v == cur)} {lbl}", f"v:{path}:{v}:{screen_id}") for v, lbl in options]]
+
+
+def plural(n, forms=("файл", "файла", "файлов")):
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return forms[0]
+    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        return forms[1]
+    return forms[2]
+
+
+def human_size(sz) -> str:
+    if not sz:
+        return "размер неизвестен"
+    if sz >= 1073741824:
+        return f"{sz / 1073741824:.1f} ГБ"
+    if sz >= 1048576:
+        return f"{sz / 1048576:.1f} МБ"
+    return f"{sz / 1024:.0f} КБ"
+
+
+def root_kb(uid) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="🛡 Антискам", callback_data="m:scam")],
-        [InlineKeyboardButton(text="🔪 Фильтр сообщений", callback_data="m:filter")],
-        [InlineKeyboardButton(text=f"{dot(u['antidelete'])} Анти-делит", callback_data="m:ad")],
-        [InlineKeyboardButton(text=f"{dot(u['save_media'])} Архив медиа", callback_data="m:sm")],
-        [InlineKeyboardButton(text=f"{dot(u['save_own'])} Архивировать свои медиа",
-                              callback_data="m:so")],
-        [InlineKeyboardButton(text=f"🌸 Мод: {u['mode'] or 'выкл'}", callback_data="m:mode")],
-        [InlineKeyboardButton(text="❓ Команды", callback_data="m:help")],
+        [B("🛡 Защита", "n:guard"), B("🎨 Стиль", "n:style")],
+        [B("📦 Архив", "n:arch"), B("💬 Диалоги", "n:dialogs")],
+        [B("📊 Сводка", "n:stats"), B("❓ Команды", "n:help")],
     ]
+    if not conn_of(uid):
+        rows.insert(0, [B("🚀 Подключить бота", "n:setup")])
     if uid in ADMINS:
-        rows.append([InlineKeyboardButton(text="🛠 Админка", callback_data="adm:root")])
+        rows.append([B("🛠 Админка", "adm:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def scam_kb(uid) -> InlineKeyboardMarkup:
-    a = user(uid)["antiscam"]
-    t = [("enabled", "Антискам"), ("new_dialog", "Уведомления о новых диалогах"),
-         ("unknown_bot", "Уведомления о незнакомых ботах"),
-         ("scam", "Уведомления о скамерах"),
-         ("exec_files", "Уведомления об исполняемых файлах")]
-    rows = [[InlineKeyboardButton(text=f"{dot(a[k])} {lbl}", callback_data=f"tg:antiscam:{k}")]
-            for k, lbl in t]
-    rows.append([InlineKeyboardButton(text="‹ Назад", callback_data="m:root")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+main_kb = root_kb          # имя из старого кода — пусть живёт
 
 
-def filter_kb(uid) -> InlineKeyboardMarkup:
-    f = user(uid)["filter"]
-    t = [("enabled", "Включено"), ("delete", "Удалять сообщение"),
-         ("numbers", "Номера"), ("links", "Ссылки"), ("buttons", "Кнопки"),
-         ("words_on", "Определённые слова")]
-    rows = [[InlineKeyboardButton(text=f"{dot(f[k])} {lbl}", callback_data=f"tg:filter:{k}")]
-            for k, lbl in t]
-    rows.append([InlineKeyboardButton(text=f"📝 Список слов ({len(f['words'])})",
-                                      callback_data="m:words")])
-    rows.append([InlineKeyboardButton(text="‹ Назад", callback_data="m:root")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+async def screen(uid: int, name: str, arg: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура экрана. Единственное место, где рисуется меню."""
+    u = user(uid)
+
+    # ── главный ──
+    if name == "root":
+        conn = conn_of(uid)
+        n, sz = await call(st.media_stats, uid)
+        known, trusted = st.counts(uid)
+        mode = u["mode"]
+        line = "✅ подключён" if conn else "⚠️ не подключён"
+        extra = []
+        if u.get("quiet"):
+            extra.append(f"🌙 {esc(u['quiet'])}")
+        if u.get("away_on"):
+            extra.append("💤 автоответ")
+        if u.get("digest"):
+            extra.append("📬 сводка")
+        txt = f"♡ <b>Karzen Bot</b> · {line}\n"
+        if extra:
+            txt += " · ".join(extra) + "\n"
+        txt += (
+            f"\n🛡 <b>Защита</b> · антискам {'вкл' if u['antiscam']['enabled'] else 'выкл'}"
+            f" · фильтр {'вкл' if u['filter']['enabled'] else 'выкл'}"
+            f" · {SENS_RU[u.get('sens', 'normal')]}\n"
+            f"🎨 <b>Стиль</b> · {mode or 'без мода'} · {u.get('mode_level', 'normal')}\n"
+            f"📦 <b>Архив</b> · {n} {plural(n)} · {human_size(sz)}\n"
+            f"💬 <b>Диалоги</b> · {known} всего · {trusted} доверенных · "
+            f"🔪 поймано {u['caught']}")
+        if not conn:
+            txt += ("\n\n⚠️ Бот ещё не подключён к твоему Telegram — "
+                    "жми «Подключить», это минута.")
+        return txt, root_kb(uid)
+
+    # ── защита ──
+    if name == "guard":
+        a, f = u["antiscam"], u["filter"]
+        rows = [
+            [B(f"{dot(a['enabled'])} Антискам ›", "n:scam"),
+             B(f"{dot(f['enabled'])} Фильтр ›", "n:filter")],
+        ]
+        rows += choice(u, "sens", "guard",
+                       [("low", "мягко"), ("normal", "обычно"), ("high", "строго")])
+        rows += [[B("🔪 Журнал срабатываний", "n:log:0")],
+                 [B("‹ Меню", "n:root")]]
+        return (f"🛡 <b>Защита</b>\n\n"
+                f"<b>Антискам</b> читает первое сообщение от незнакомого человека и "
+                f"считает баллы: работа/крипта, фишинг, просьбы денег, ссылки, кнопки, "
+                f"исполняемые файлы. Перебрал порог — приходит уведомление.\n"
+                f"<b>Фильтр</b> идёт дальше и удаляет такое сообщение сразу.\n\n"
+                f"Порог сейчас: <b>{threshold(u)}</b> баллов "
+                f"({SENS_RU[u.get('sens', 'normal')]})\n"
+                f"Поймано всего: <b>{u['caught']}</b>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if name == "scam":
+        rows = toggles(u, "scam", [
+            ("antiscam.enabled", "Антискам включён"),
+            ("antiscam.new_dialog", "Новый диалог"),
+            ("antiscam.unknown_bot", "Незнакомый бот"),
+            ("antiscam.scam", "Похоже на развод"),
+            ("antiscam.exec_files", "Исполняемые файлы"),
+        ])
+        rows.append([B("‹ Защита", "n:guard")])
+        return ("🛡 <b>Антискам</b> · о чём предупреждать\n\n"
+                "<i>Уведомления приходят сюда, в чат с ботом. "
+                "Само сообщение остаётся у собеседника — антискам ничего не трогает.</i>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if name == "filter":
+        f = u["filter"]
+        rows = toggles(u, "filter", [
+            ("filter.enabled", "Фильтр включён"),
+            ("filter.delete", "Удалять, а не только помечать"),
+            ("filter.links", "Ссылки"),
+            ("filter.numbers", "Номера и карты"),
+            ("filter.buttons", "Инлайн-кнопки"),
+            ("filter.words_on", "Стоп-слова"),
+        ])
+        rows.append([B(f"📝 Стоп-слова ({len(f['words'])})", "n:words")])
+        rows.append([B("‹ Защита", "n:guard")])
+        return ("🔪 <b>Фильтр первых сообщений</b>\n\n"
+                "Работает только на первом сообщении от того, с кем ты ещё не общался. "
+                "Знакомые и доверенные проходят мимо фильтра всегда.\n\n"
+                "⚠️ Для удаления нужно право «удалять любые сообщения».",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if name == "words":
+        words = u["filter"]["words"]
+        rows = [[B(f"✕ {w[:20]}", f"n:wdel:{i}")] for i, w in enumerate(words[:12])]
+        rows.append([B("‹ Фильтр", "n:filter")])
+        return (f"📝 <b>Стоп-слова</b> ({len(words)})\n\n"
+                + (", ".join(esc(w) for w in words) or "<i>пусто</i>")
+                + "\n\nДобавить: <code>.word +слово</code>\n"
+                  "Нажми на слово ниже, чтобы убрать.\n\n"
+                  "<i>Сравнение идёт по очищенному тексту, так что "
+                  "«к.а.з.и.н.о» и «кaзино» латиницей тоже ловятся.</i>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    # ── стиль ──
+    if name == "style":
+        rows, line = [], []
+        for key, (ico, title, hint) in MODE_UI.items():
+            line.append(B(f"{pill(u['mode'] == key)} {ico} {title}", f"v:mode:{key}:style"))
+            if len(line) == 2:
+                rows.append(line)
+                line = []
+        if line:
+            rows.append(line)
+        rows.append([B(f"{pill(not u['mode'])} 🚫 без мода", "v:mode:off:style")])
+        rows += choice(u, "mode_level", "style",
+                       [("soft", "мягко"), ("normal", "обычно"), ("max", "максимум")])
+        rows += toggles(u, "style", [("mode_bold", "Выделять мой текст жирным"),
+                                     ("mode_emoji", "Эмодзи под настроение")])
+        rows.append([B("🎲 Ещё пример", "n:style"), B("‹ Меню", "n:root")])
+        return (f"🎨 <b>Стиль речи</b> · {u['mode'] or 'выключен'}\n\n"
+                f"Всё, что ты пишешь сам, бот переписывает в выбранной манере. "
+                f"Твоя фраза остаётся ядром — декор встаёт вокруг неё.\n\n"
+                f"<b>Так это выглядит:</b>\n{preview(u['mode'], u)}\n\n"
+                f"<i>Мод на один диалог — команда <code>.here kawaii</code> прямо в нём.</i>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    # ── архив ──
+    if name == "arch":
+        n, sz = await call(st.media_stats, uid)
+        rows = toggles(u, "arch", [
+            ("save_media", "Архив медиа"),
+            ("save_own", "Архивировать и свои"),
+            ("antidelete", "Сохранять удалённые сообщения"),
+            ("track_edits", "Показывать правки «было → стало»"),
+            ("digest", "Сводка за день в 21:00"),
+        ])
+        rows += choice(u, "save_when", "arch",
+                       [("deleted", "при удалении"), ("always", "сразу")])
+        rows += [[B("🧾 Последние файлы", "n:recent")],
+                 [B("‹ Меню", "n:root")]]
+        return (f"📦 <b>Архив</b> · {n} {plural(n)} · {human_size(sz)}\n\n"
+                f"Копии уходят сюда, в чат с ботом: диск на хостинге стирается "
+                f"при каждом обновлении, а в Telegram копия лежит вечно.\n\n"
+                f"<i>«При удалении» — архив чище, но одноразовые медиа могут не успеть "
+                f"сохраниться. «Сразу» — не пропустит ничего, но и весит больше.</i>\n"
+                f"<i>Файлы тяжелее 20 МБ сохраняются ссылкой на оригинал — "
+                f"Bot API не даёт их скачать.</i>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if name == "recent":
+        rows = await call(st.recent_media, uid, 12)
+        lines = [f"• <b>{r['kind']}</b> от <code>{r['sender']}</code> · "
+                 f"{ts_local(r['ts']):%d.%m %H:%M}" for r in rows]
+        return ("🧾 <b>Последнее в архиве</b>\n\n" + ("\n".join(lines) or "<i>пусто</i>"),
+                InlineKeyboardMarkup(inline_keyboard=[[B("‹ Архив", "n:arch")]]))
+
+    # ── диалоги ──
+    if name == "dialogs":
+        known, trusted = st.counts(uid)
+        muted = u.get("muted") or []
+        rows = toggles(u, "dialogs", [("away_on", "Автоответ «я отошёл»")])
+        if muted:
+            rows.append([B(f"🔔 Снять заглушение со всех ({len(muted)})", "n:unmuteall")])
+        rows.append([B("‹ Меню", "n:root")])
+        away = (f"<blockquote>{esc(u['away'])}</blockquote>" if u.get("away")
+                else "<i>текст не задан — <code>.away текст</code></i>")
+        return (f"💬 <b>Диалоги</b>\n\n"
+                f"Всего знакомых: <b>{known}</b>\n"
+                f"✅ Доверенных: <b>{trusted}</b> — их бот не проверяет\n"
+                f"🔕 Заглушённых: <b>{len(muted)}</b>\n"
+                f"🤝 Совместных модов: <b>{len(u['pairs'])}</b>\n\n"
+                f"🌙 <b>Тихие часы:</b> {esc(u['quiet']) if u.get('quiet') else 'выключены'}"
+                f" · <code>.quiet 23:00-08:00</code>\n\n"
+                f"💤 <b>Автоответ</b> (раз в 6 ч на человека):\n{away}\n\n"
+                f"<i>Доверие и заглушение ставятся кнопками прямо под уведомлением "
+                f"или командами <code>.trust</code> / <code>.mute</code> в нужном диалоге.</i>",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    # ── журнал ──
+    if name == "log":
+        page = max(0, int(arg or 0))
+        per = 5
+        rows_all = st.recent_catches(uid, 50)
+        pages = max(1, (len(rows_all) + per - 1) // per)
+        page = min(page, pages - 1)
+        chunk = rows_all[page * per:page * per + per]
+        out = []
+        for r in chunk:
+            mark = "🗑" if r["action"] == "deleted" else "⚠️"
+            out.append(f"{mark} <b>{ts_local(r['ts']):%d.%m %H:%M}</b> · "
+                       f"<code>{r['peer']}</code> · {esc(r['reason'])} [{r['score']}]\n"
+                       f"<blockquote>{esc((r['text'] or '')[:160])}</blockquote>")
+        nav = []
+        if page > 0:
+            nav.append(B("‹", f"n:log:{page - 1}"))
+        nav.append(B(f"{page + 1}/{pages}", "n:noop"))
+        if page < pages - 1:
+            nav.append(B("›", f"n:log:{page + 1}"))
+        return ("🔪 <b>Журнал защиты</b>\n\n" + ("\n\n".join(out) or "<i>пока пусто</i>"),
+                InlineKeyboardMarkup(inline_keyboard=[nav, [B("‹ Защита", "n:guard")]]))
+
+    # ── сводка по себе ──
+    if name == "stats":
+        known, trusted = st.counts(uid)
+        n, sz = await call(st.media_stats, uid)
+        day = [r for r in st.recent_catches(uid, 50)
+               if time.time() - r["ts"] < 86400]
+        return (f"📊 <b>{esc(u['name'] or 'ты')}</b>\n\n"
+                f"🔪 Поймано: <b>{u['caught']}</b> · за сутки: <b>{len(day)}</b>\n"
+                f"💬 Диалогов: <b>{known}</b> · ✅ доверенных: <b>{trusted}</b>\n"
+                f"📦 В архиве: <b>{n}</b> {plural(n)} · {human_size(sz)}\n"
+                f"🎨 Мод: <b>{u['mode'] or 'выкл'}</b> · для отдельных чатов: "
+                f"<b>{len(u.get('chat_modes') or {})}</b>\n"
+                f"🤝 Пар: <b>{len(u['pairs'])}</b> · ⌨️ команд: <b>{u['cmds']}</b>\n"
+                f"📅 С {ts_local(u['first_seen']):%d.%m.%Y}",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [B("📤 Выгрузить файлом", "n:export")],
+                    [B("‹ Меню", "n:root")]]))
+
+    # ── онбординг ──
+    if name == "setup":
+        me = await bot.get_me()
+        return (SETUP_STEPS.format(username=f"@{me.username}"),
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [B("🔄 Проверить подключение", "n:check")],
+                    [B("❓ Не получается", "n:trouble")],
+                    [B("‹ Меню", "n:root")]]))
+
+    if name == "trouble":
+        return (TROUBLE, InlineKeyboardMarkup(inline_keyboard=[
+            [B("🔄 Проверить", "n:check")], [B("‹ Меню", "n:root")]]))
+
+    if name == "help":
+        return CMD_HELP, help_kb()
+
+    return "♡ <b>Karzen Bot</b>", root_kb(uid)
+
+
+async def show(cb: CallbackQuery, name: str, arg: str = "", toast: str = ""):
+    """Перерисовать сообщение под новый экран. Telegram ругается, если
+    текст не изменился, — на это и молчим."""
+    txt, kb = await screen(cb.from_user.id, name, arg)
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer(toast)
 
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    user(m.from_user.id, m.from_user)
-    ok = conn_of(m.from_user.id) is not None
-    st = "✅ подключён" if ok else ("⚠️ не подключён\nНастройки → Telegram для бизнеса → Чат-боты")
-    await m.answer(f"♡ <b>Karzen Bot</b>\n\nСтатус: {st}", reply_markup=main_kb(m.from_user.id))
+    u = user(m.from_user.id, m.from_user)
+    # deep link: /start ref_123456 — запоминаем, кто привёл
+    arg = (m.text or "").split(maxsplit=1)
+    if len(arg) > 1 and arg[1].startswith("ref_") and not u.get("ref"):
+        try:
+            ref = int(arg[1][4:])
+            if ref != m.from_user.id:
+                u["ref"] = ref
+                inviter = user(ref)
+                inviter["invited"] = inviter.get("invited", 0) + 1
+                save(m.from_user.id)
+                save(ref)
+                await dm(ref, f"🎉 По твоей ссылке пришёл "
+                              f"<b>{esc(m.from_user.full_name)}</b>")
+        except ValueError:
+            pass
+    txt, kb = await screen(m.from_user.id, "root" if conn_of(m.from_user.id) else "setup")
+    await m.answer(txt, reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("tg:"))
-async def toggle(cb: CallbackQuery):
-    _, section, key = cb.data.split(":")
-    u = user(cb.from_user.id)
-    u[section][key] = not u[section][key]
-    save()
-    kb = scam_kb(cb.from_user.id) if section == "antiscam" else filter_kb(cb.from_user.id)
-    await cb.message.edit_reply_markup(reply_markup=kb)
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("m:"))
-async def menu(cb: CallbackQuery):
-    what = cb.data.split(":")[1]
+@dp.callback_query(F.data.startswith("n:"))
+async def nav(cb: CallbackQuery):
+    p = cb.data.split(":")
+    what, arg = p[1], (p[2] if len(p) > 2 else "")
     uid = cb.from_user.id
     u = user(uid, cb.from_user)
-    back = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="‹ Назад", callback_data="m:root")]])
+
+    if what == "noop":
+        return await cb.answer()
     if what == "check":
-        me = await bot.get_me()
-        if conn_of(uid):
-            r = None
-            await cb.message.edit_text(
-                "✅ <b>Подключено!</b>\n\nБот теперь работает в выбранных чатах.\n"
-                "Ниже — настройки, всё уже включено по умолчанию.",
-                reply_markup=main_kb(uid))
-            await cb.answer("Есть контакт!")
-        else:
-            await cb.answer("Пока не вижу подключения — проверь шаг 3", show_alert=True)
-        return
-    if what == "trouble":
-        await cb.message.edit_text(TROUBLE, reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить",
-                                                   callback_data="m:check")]]))
-        await cb.answer()
-        return
-    if what == "scam":
-        await cb.message.edit_text(
-            "🛡 <b>Антискам</b>\n\nПроверяет первые сообщения от новых собеседников: "
-            "предложения работы, крипта, фишинг, просьбы денег, ссылки, кнопки, "
-            "исполняемые файлы. При срабатывании — уведомление тебе в этот чат.\n\n"
-            f"Поймано всего: <b>{u['caught']}</b>", reply_markup=scam_kb(uid))
-    elif what == "filter":
-        await cb.message.edit_text(
-            "🔪 <b>Фильтр сообщений</b>\n\nУдаляет первые сообщения от тех, с кем у тебя "
-            "не было диалога, если они похожи на спам или развод. Текст удалённого "
-            "придёт тебе сюда.\n\n⚠️ Нужны права «удалять любые сообщения».",
-            reply_markup=filter_kb(uid))
-    elif what == "words":
-        lst = ", ".join(u["filter"]["words"]) or "пусто"
-        await cb.message.edit_text(
-            f"📝 <b>Стоп-слова</b> ({len(u['filter']['words'])})\n\n{lst}\n\n"
-            f"Добавить: <code>.word +слово</code>\nУбрать: <code>.word -слово</code>",
-            reply_markup=back)
-    elif what in ("ad", "sm", "so"):
-        key = {"ad": "antidelete", "sm": "save_media", "so": "save_own"}[what]
-        u[key] = not u[key]
+        if not conn_of(uid):
+            return await cb.answer("Пока не вижу подключения — проверь шаг 3",
+                                   show_alert=True)
+        return await show(cb, "root", toast="Есть контакт!")
+    if what == "wdel":
+        words = u["filter"]["words"]
+        i = int(arg or -1)
+        if 0 <= i < len(words):
+            words.pop(i)
+            save(uid)
+        return await show(cb, "words", toast="Убрано")
+    if what == "unmuteall":
+        u["muted"] = []
         save(uid)
-        await cb.message.edit_reply_markup(reply_markup=main_kb(uid))
-    elif what == "mode":
-        rows = [[InlineKeyboardButton(text=x, callback_data=f"sm:{x}")] for x in MODES]
-        rows += [[InlineKeyboardButton(text="🔕 Выключить", callback_data="sm:off")],
-                 [InlineKeyboardButton(text="‹ Назад", callback_data="m:root")]]
-        await cb.message.edit_text("🌸 Выбери стиль:",
-                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    elif what == "help":
-        await cb.message.edit_text(CMD_HELP, reply_markup=back)
+        return await show(cb, "dialogs", toast="Все снова слышны 🔔")
+    if what == "export":
+        await cb.answer("Собираю…")
+        return await send_export(uid)
+    await show(cb, what, arg)
+
+
+@dp.callback_query(F.data.startswith("t:"))
+async def toggle(cb: CallbackQuery):
+    p = cb.data.split(":")
+    path, back_to = p[1], (p[2] if len(p) > 2 else "root")
+    u = user(cb.from_user.id)
+    dig_set(u, path, not dig(u, path))
+    save(cb.from_user.id)
+    await show(cb, back_to)
+
+
+@dp.callback_query(F.data.startswith("v:"))
+async def setval(cb: CallbackQuery):
+    p = cb.data.split(":")
+    path, val, back_to = p[1], p[2], (p[3] if len(p) > 3 else "root")
+    u = user(cb.from_user.id)
+    if path == "mode":
+        u["mode"] = None if val == "off" else (val if val in MODES else None)
+    elif path == "sens":
+        u["sens"] = val if val in SENS else "normal"
+    elif path == "mode_level":
+        u["mode_level"] = val if val in LEVELS else "normal"
+    elif path == "save_when":
+        u["save_when"] = val if val in ("always", "deleted") else "deleted"
     else:
-        await cb.message.edit_text("♡ <b>Karzen Bot</b>", reply_markup=main_kb(uid))
+        return await cb.answer()
+    save(cb.from_user.id)
+    await show(cb, back_to)
+
+
+@dp.callback_query(F.data.startswith("h:"))
+async def help_nav(cb: CallbackQuery):
+    key = cb.data.split(":")[1]
+    body = HELP.get(key, (None, None, CMD_HELP))[2]
+    try:
+        await cb.message.edit_text(body, reply_markup=help_kb(key))
+    except Exception:
+        pass
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("sm:"))
-async def setmode(cb: CallbackQuery):
-    x = cb.data.split(":")[1]
-    user(cb.from_user.id)["mode"] = None if x == "off" else x
-    save()
-    await cb.message.edit_text("♡ <b>Karzen Bot</b>", reply_markup=main_kb(cb.from_user.id))
-    await cb.answer("Сохранено")
+async def send_export(uid: int):
+    """Настройки и журнал — одним JSON-файлом. Полезно перед сменой
+    хостинга и просто чтобы видеть, что бот о тебе знает."""
+    u = dict(user(uid))
+    n, sz = await call(st.media_stats, uid)
+    data = {
+        "exported": now_local().isoformat(timespec="seconds"),
+        "user": {k: v for k, v in u.items() if k not in ("name", "username")},
+        "archive": {"files": n, "bytes": sz},
+        "catches": [dict(r) for r in st.recent_catches(uid, 200)],
+    }
+    raw = json.dumps(data, ensure_ascii=False, indent=2).encode()
+    c = conn_of(uid)
+    if not c:
+        return
+    try:
+        await bot.send_document(
+            c["chat"],
+            BufferedInputFile(raw, f"karzen_{now_local():%Y%m%d}.json"),
+            caption="📤 Настройки и журнал срабатываний.")
+    except Exception as ex:
+        await dm(uid, f"⚠️ Не вышло собрать выгрузку: {ex.__class__.__name__}")
+
+
+# ═════════════════════════════════════════════════════════
+#  📬 СВОДКА ЗА ДЕНЬ
+# ═════════════════════════════════════════════════════════
+#  Раз в час смотрим, у кого наступило 21:00 по его времени, и шлём
+#  итоги. Час — потому что сервер может проспать минуту-другую, а
+#  отметка «уже слали сегодня» не даёт задвоить.
+DIGEST_HOUR = 21
+digest_sent: dict[int, str] = {}
+
+
+async def digest_loop():
+    while True:
+        try:
+            await asyncio.sleep(600)
+            today = f"{now_local():%Y-%m-%d}"
+            if now_local().hour != DIGEST_HOUR:
+                continue
+            for uid in st.all_uids():
+                u = user(uid)
+                if not u.get("digest") or digest_sent.get(uid) == today:
+                    continue
+                digest_sent[uid] = today
+                catches = [r for r in st.recent_catches(uid, 100)
+                           if time.time() - r["ts"] < 86400]
+                media = [r for r in await call(st.recent_media, uid, 100)
+                         if time.time() - r["ts"] < 86400]
+                if not catches and not media:
+                    continue
+                top = ", ".join(dict.fromkeys(esc(r["reason"]).split(":")[0]
+                                              for r in catches[:5])) or "—"
+                await dm(uid, f"📬 <b>Итоги дня</b> · {now_local():%d.%m}\n\n"
+                              f"🔪 Сработок защиты: <b>{len(catches)}</b>\n"
+                              f"📦 Сохранено медиа: <b>{len(media)}</b>\n"
+                              f"🎯 Чаще всего: {top}",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [B("🔪 Журнал", "n:log:0"), B("⚙️ Меню", "n:root")]]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logging.warning("digest: %s", ex)
 
 
 
@@ -1556,16 +2324,22 @@ async def setmode(cb: CallbackQuery):
 #  поэтому хостинг не нужен — тот же адрес, что и вебхук.
 BOT_COMMANDS = [
     BotCommand(command="start", description="⚙️ Настройки"),
+    BotCommand(command="help", description="❓ Команды"),
     BotCommand(command="media", description="📦 Что в архиве"),
     BotCommand(command="log", description="🔪 Срабатывания защиты"),
+    BotCommand(command="export", description="📤 Выгрузить данные"),
     BotCommand(command="invite", description="🔗 Позвать друга"),
     BotCommand(command="setup", description="🚀 Как подключить"),
 ]
+INIT_MAX_AGE = 24 * 3600
 
 
 def check_init_data(init_data: str) -> int | None:
     """Проверить подпись Telegram и вернуть user_id. Без этого кто угодно
-    мог бы дёргать наш API и менять чужие настройки."""
+    мог бы дёргать наш API и менять чужие настройки.
+
+    Заодно смотрим на возраст: перехваченная вчерашняя строка не должна
+    открывать доступ сегодня."""
     import hashlib
     import hmac
     from urllib.parse import parse_qsl
@@ -1578,100 +2352,303 @@ def check_init_data(init_data: str) -> int | None:
         calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, got):
             return None
+        if time.time() - int(pairs.get("auth_date", 0)) > INIT_MAX_AGE:
+            return None
         return json.loads(pairs.get("user", "{}")).get("id")
     except Exception:
         return None
 
 
 MINI_APP = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Karzen Bot</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
- :root{color-scheme:light dark}
- body{margin:0;padding:16px;font:16px -apple-system,system-ui,sans-serif;
-      background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)}
- h2{font-size:15px;text-transform:uppercase;letter-spacing:.04em;opacity:.55;
-    margin:22px 0 8px;font-weight:600}
+ :root{
+   color-scheme:light dark;
+   --bg:var(--tg-theme-bg-color,#fff);
+   --fg:var(--tg-theme-text-color,#0d0d0f);
+   --card:var(--tg-theme-secondary-bg-color,#f2f2f7);
+   --hint:var(--tg-theme-hint-color,#8a8a8e);
+   --accent:var(--tg-theme-button-color,#3390ec);
+   --accent-fg:var(--tg-theme-button-text-color,#fff);
+   --danger:#e5484d;
+ }
+ *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+ body{margin:0;padding:12px 14px 40px;font:16px/1.4 -apple-system,system-ui,"Segoe UI",sans-serif;
+      background:var(--bg);color:var(--fg)}
+ h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--hint);
+    margin:20px 4px 8px;font-weight:600}
+
+ /* шапка со статусом подключения */
+ .top{display:flex;align-items:center;gap:10px;margin:4px 2px 14px}
+ .top .name{font-weight:600;font-size:17px}
+ .badge{margin-left:auto;font-size:12px;padding:4px 10px;border-radius:20px;
+        background:var(--card);color:var(--hint)}
+ .badge.on{background:rgba(52,199,89,.16);color:#2f9e44}
+ .badge.off{background:rgba(229,72,77,.14);color:var(--danger)}
+
+ /* плитки статистики */
+ .stat{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:6px}
+ .stat div{text-align:center;padding:12px 4px;border-radius:14px;background:var(--card)}
+ .stat span{display:block;font-size:20px;font-weight:650;letter-spacing:-.02em}
+ .stat em{font-size:10.5px;color:var(--hint);font-style:normal}
+
+ /* вкладки */
+ .tabs{display:flex;gap:4px;padding:4px;background:var(--card);border-radius:14px;
+       margin:14px 0 4px;position:sticky;top:6px;z-index:5;backdrop-filter:blur(12px)}
+ .tabs button{flex:1;border:0;background:transparent;color:var(--hint);font:inherit;
+   font-size:13px;font-weight:550;padding:9px 4px;border-radius:11px;transition:.18s}
+ .tabs button.on{background:var(--bg);color:var(--fg);box-shadow:0 1px 3px #0002}
+
  .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
-      padding:13px 14px;background:var(--tg-theme-secondary-bg-color,#f2f2f7);
-      border-radius:12px;margin-bottom:8px}
- .row b{font-weight:500}
- .row small{display:block;opacity:.5;font-size:12px;margin-top:2px}
+      padding:13px 14px;background:var(--card);border-radius:14px;margin-bottom:8px}
+ .row b{font-weight:500;font-size:15px}
+ .row small{display:block;color:var(--hint);font-size:12px;margin-top:3px;line-height:1.35}
+
  .sw{position:relative;width:50px;height:30px;flex:none}
  .sw input{opacity:0;width:0;height:0}
- .sl{position:absolute;inset:0;background:#8888;border-radius:30px;
-     transition:.2s;cursor:pointer}
+ .sl{position:absolute;inset:0;background:#8884;border-radius:30px;transition:.2s;cursor:pointer}
  .sl:before{content:"";position:absolute;height:24px;width:24px;left:3px;top:3px;
-     background:#fff;border-radius:50%;transition:.2s}
- input:checked+.sl{background:var(--tg-theme-button-color,#3390ec)}
+     background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px #0003}
+ input:checked+.sl{background:var(--accent)}
  input:checked+.sl:before{transform:translateX(20px)}
- select{background:var(--tg-theme-bg-color,#fff);color:inherit;border:0;
-        font-size:16px;padding:6px;border-radius:8px}
- .stat{display:flex;gap:10px;margin-bottom:14px}
- .stat div{flex:1;text-align:center;padding:12px 6px;border-radius:12px;
-     background:var(--tg-theme-secondary-bg-color,#f2f2f7)}
- .stat span{display:block;font-size:22px;font-weight:600}
- .stat em{font-size:11px;opacity:.5;font-style:normal}
+
+ /* сегментированный выбор */
+ .seg{display:flex;gap:3px;padding:3px;background:#8881;border-radius:11px;flex:none}
+ .seg button{border:0;background:transparent;color:var(--hint);font:inherit;font-size:13px;
+   padding:7px 11px;border-radius:9px;transition:.15s}
+ .seg button.on{background:var(--accent);color:var(--accent-fg)}
+
+ /* сетка выбора мода */
+ .modes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+ .mode{display:flex;align-items:center;gap:9px;padding:12px;border-radius:14px;
+       background:var(--card);border:2px solid transparent;transition:.15s}
+ .mode.on{border-color:var(--accent)}
+ .mode i{font-style:normal;font-size:19px}
+ .mode b{font-weight:550;font-size:14px;display:block}
+ .mode small{color:var(--hint);font-size:11px}
+
+ .preview{padding:14px;border-radius:14px;background:var(--card);margin-top:10px;
+          font-size:15px;min-height:22px}
+ .preview .lbl{display:block;font-size:11px;color:var(--hint);text-transform:uppercase;
+               letter-spacing:.05em;margin-bottom:6px}
+
+ /* поля ввода */
+ .field{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:8px}
+ .field label{display:block;font-size:12px;color:var(--hint);margin-bottom:6px}
+ .field input,.field textarea{width:100%;background:transparent;border:0;color:inherit;
+   font:inherit;resize:vertical;outline:none}
+ .field input::placeholder,.field textarea::placeholder{color:var(--hint)}
+
+ .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
+ .chip{display:flex;align-items:center;gap:6px;background:var(--card);border-radius:20px;
+       padding:7px 8px 7px 13px;font-size:14px}
+ .chip button{border:0;background:#8882;color:var(--hint);border-radius:50%;width:20px;
+   height:20px;line-height:18px;font-size:13px;padding:0}
+
+ .empty{color:var(--hint);font-size:14px;text-align:center;padding:22px 10px}
+ .log{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:8px}
+ .log .h{font-size:12px;color:var(--hint);margin-bottom:5px}
+ .log .t{font-size:14px;word-break:break-word}
+ .skel{height:64px;border-radius:14px;background:var(--card);margin-bottom:8px;
+       animation:pulse 1.2s ease-in-out infinite}
+ @keyframes pulse{50%{opacity:.5}}
+ .hidden{display:none}
+ .toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,80px);
+   background:var(--fg);color:var(--bg);padding:10px 18px;border-radius:22px;font-size:14px;
+   opacity:0;transition:.25s;z-index:20}
+ .toast.on{transform:translate(-50%,0);opacity:.94}
 </style></head><body>
+
+<div class="top">
+  <div><div class="name" id="who">Karzen Bot</div></div>
+  <div class="badge" id="conn">…</div>
+</div>
+
 <div class="stat">
   <div><span id="s_media">–</span><em>в архиве</em></div>
   <div><span id="s_caught">–</span><em>поймано</em></div>
-  <div><span id="s_pairs">–</span><em>пар</em></div>
+  <div><span id="s_known">–</span><em>диалогов</em></div>
+  <div><span id="s_trust">–</span><em>доверенных</em></div>
 </div>
 
-<h2>Стиль</h2>
-<div class="row"><div><b>Словесный мод</b><small>применяется ко всему, что пишешь</small></div>
-  <select id="mode" onchange="setMode(this.value)">
-    <option value="">выключен</option><option value="kawaii">kawaii</option>
-    <option value="tsundere">tsundere</option><option value="yandere">yandere</option>
-    <option value="leet">leet</option></select></div>
+<div class="tabs">
+  <button data-tab="style" class="on">🎨 Стиль</button>
+  <button data-tab="guard">🛡 Защита</button>
+  <button data-tab="arch">📦 Архив</button>
+  <button data-tab="log">🔪 Журнал</button>
+</div>
 
-<div class="row"><div><b>Интенсивность</b><small>сколько стиля вокруг текста</small></div>
-  <select id="level" onchange="setKey('mode_level',this.value)">
-    <option value="soft">мягко</option><option value="normal">обычно</option>
-    <option value="max">максимум</option></select></div>
-<div class="row"><div><b>Эмодзи</b><small>под настроение режима</small></div>
-  <label class="sw"><input type="checkbox" id="emoji"
-   onchange="setKey('mode_emoji',this.checked)"><span class="sl"></span></label></div>
-<div class="row"><div><b>Выделять мой текст</b><small>твоя фраза жирным, декор обычным</small></div>
-  <label class="sw"><input type="checkbox" id="bold"
-   onchange="setKey('mode_bold',this.checked)"><span class="sl"></span></label></div>
+<div id="body"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+<div class="toast" id="toast"></div>
 
-<h2>Сохранение</h2>
-<div class="row"><div><b>Когда сохранять медиа</b><small>«при удалении» — архив чище,
- но одноразовые могут не успеть</small></div>
-  <select id="when" onchange="setKey('save_when',this.value)">
-    <option value="deleted">при удалении</option>
-    <option value="always">сразу</option></select></div>
-<div id="box"></div>
 <script>
 const tg = Telegram.WebApp; tg.ready(); tg.expand();
-const T = [
- ["antidelete","Анти-делит","удалённые сообщения приходят тебе"],
- ["save_media","Архив медиа","копии фото, видео и голосовых"],
- ["save_own","Свои медиа","архивировать и то, что шлёшь сам"],
- ["track_edits","Правки сообщений","показывать «было → стало»"],
- ["scam","Антискам","проверка первых сообщений"],
- ["filter","Фильтр спама","удалять подозрительное автоматически"],
-];
-function row(k,t,d,v){return `<div class="row"><div><b>${t}</b><small>${d}</small></div>
+let D = {}, TAB = "style", LOG = [];
+
+const E = s => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $ = id => document.getElementById(id);
+
+function tap(kind="light"){ try{ tg.HapticFeedback.impactOccurred(kind) }catch(e){} }
+function toast(t){
+  const el = $("toast"); el.textContent = t; el.classList.add("on");
+  clearTimeout(el._t); el._t = setTimeout(()=>el.classList.remove("on"), 1600);
+}
+
+async function api(path, body={}){
+  try{
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({init: tg.initData, ...body})});
+    return await r.json();
+  }catch(e){ toast("Нет связи с ботом"); return {error:"network"} }
+}
+
+/* ── элементы ─────────────────────────────────────────── */
+const sw = (k,t,d,v) => `<div class="row"><div><b>${t}</b><small>${d}</small></div>
  <label class="sw"><input type="checkbox" ${v?"checked":""}
- onchange="toggle('${k}',this.checked)"><span class="sl"></span></label></div>`}
-async function api(path,body={}){
- const r = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({init:tg.initData,...body})});
- return r.json();
+ onchange="setKey('${k}',this.checked)"><span class="sl"></span></label></div>`;
+
+const seg = (k,t,d,opts,cur) => `<div class="row"><div><b>${t}</b><small>${d}</small></div>
+ <div class="seg">${opts.map(([v,l])=>
+   `<button class="${v===cur?"on":""}" onclick="setKey('${k}','${v}')">${l}</button>`).join("")}</div></div>`;
+
+const field = (k,t,ph,v,area) => `<div class="field"><label>${t}</label>
+ ${area ? `<textarea rows="2" placeholder="${ph}" onchange="setKey('${k}',this.value)"
+    >${E(v||"")}</textarea>`
+        : `<input value="${E(v||"")}" placeholder="${ph}" onchange="setKey('${k}',this.value)">`}
+ </div>`;
+
+/* ── вкладки ──────────────────────────────────────────── */
+const MODES = [
+ ["kawaii","🌸","kawaii","ня~ и сердечки"], ["tsundere","💢","tsundere","б-бака!"],
+ ["yandere","🔪","yandere","ты только мой"], ["leet","👾","leet","h4ck3r"],
+ ["small","🔡","small","мелкие капсы"],     ["bubble","🫧","bubble","Ⓑ Ⓤ Ⓑ"],
+ ["mock","🐔","mock","sPoNgEbOb"],          ["","🚫","без мода","как написал"],
+];
+
+function viewStyle(){
+  return `<h2>Мод</h2>
+  <div class="modes">${MODES.map(([k,i,n,d])=>`
+    <div class="mode ${((D.mode||"")===k)?"on":""}" onclick="setKey('mode','${k}')">
+      <i>${i}</i><div><b>${n}</b><small>${d}</small></div></div>`).join("")}</div>
+  <div class="preview" id="pv"><span class="lbl">как это увидит собеседник</span>
+    <span id="pvt">${E(D.preview||"")}</span></div>
+  <h2>Настройка</h2>
+  ${seg("mode_level","Интенсивность","сколько декора вокруг фразы",
+        [["soft","мягко"],["normal","обычно"],["max","макс"]], D.mode_level)}
+  ${sw("mode_bold","Выделять мой текст","твоя фраза жирным, декор обычным", D.mode_bold)}
+  ${sw("mode_emoji","Эмодзи","под настроение режима", D.mode_emoji)}
+  <div class="empty">Мод для одного диалога — команда <b>.here kawaii</b> прямо в нём</div>`;
 }
+
+function viewGuard(){
+  return `<h2>Проверка входящих</h2>
+  ${sw("scam","Антискам","разбирает первое сообщение от незнакомца", D.scam)}
+  ${seg("sens","Строгость","строже — ловит больше, но и ошибается чаще",
+        [["low","мягко"],["normal","обычно"],["high","строго"]], D.sens)}
+  ${sw("new_dialog","Новый диалог","сообщать, когда пишет кто-то впервые", D.new_dialog)}
+  ${sw("unknown_bot","Незнакомые боты","", D.unknown_bot)}
+  ${sw("exec_files",".apk и .exe","предупреждать об исполняемых файлах", D.exec_files)}
+  <h2>Автоудаление</h2>
+  ${sw("filter","Фильтр первых сообщений","знакомых и доверенных не трогает", D.filter)}
+  ${sw("filter_delete","Удалять","иначе только помечать уведомлением", D.filter_delete)}
+  ${sw("links","Ссылки","", D.links)}
+  ${sw("numbers","Номера и карты","", D.numbers)}
+  ${sw("buttons","Инлайн-кнопки","", D.buttons)}
+  ${sw("words_on","Стоп-слова","список ниже", D.words_on)}
+  <div class="field"><label>Добавить стоп-слово</label>
+    <input id="w" placeholder="например: казино" onchange="addWord(this)"></div>
+  <div class="chips" id="chips">${(D.words||[]).map((w,i)=>
+    `<span class="chip">${E(w)}<button onclick="delWord(${i})">✕</button></span>`).join("")
+    || '<div class="empty">Пусто</div>'}</div>
+  <h2>Покой</h2>
+  ${field("quiet","Тихие часы — уведомления без звука","23:00-08:00", D.quiet)}
+  ${sw("away_on","Автоответ «я отошёл»","уйдёт раз в 6 часов на человека", D.away_on)}
+  ${field("away","Текст автоответа","я сейчас не у телефона, отвечу позже", D.away, true)}`;
+}
+
+function viewArch(){
+  return `<h2>Что сохранять</h2>
+  ${sw("save_media","Архив медиа","копии фото, видео и голосовых к тебе в чат", D.save_media)}
+  ${sw("save_own","Свои медиа","архивировать и то, что шлёшь сам", D.save_own)}
+  ${seg("save_when","Когда","«при удалении» чище, но одноразовые могут не успеть",
+        [["deleted","при удалении"],["always","сразу"]], D.save_when)}
+  <h2>Следы</h2>
+  ${sw("antidelete","Анти-делит","удалённое собеседником приходит тебе", D.antidelete)}
+  ${sw("track_edits","Правки","показывать «было → стало»", D.track_edits)}
+  ${sw("digest","Сводка за день","итоги в 21:00", D.digest)}
+  <div class="empty">В архиве ${D.media} файлов · ${E(D.media_size||"")}<br>
+    Выгрузить всё — команда <b>.export</b></div>`;
+}
+
+function viewLog(){
+  if(!LOG.length) return '<div class="empty">Защита пока не срабатывала 🍃</div>';
+  return LOG.map(r=>`<div class="log">
+    <div class="h">${r.action==="deleted"?"🗑 удалено":"⚠️ помечено"} · ${E(r.when)} ·
+      ${E(r.reason)} [${r.score}]</div>
+    <div class="t">${E(r.text||"—")}</div></div>`).join("");
+}
+
+const VIEWS = {style:viewStyle, guard:viewGuard, arch:viewArch, log:viewLog};
+
+function render(){
+  $("body").innerHTML = VIEWS[TAB]();
+  document.querySelectorAll(".tabs button").forEach(b =>
+    b.classList.toggle("on", b.dataset.tab === TAB));
+}
+
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = async () => {
+  tap(); TAB = b.dataset.tab;
+  if(TAB === "log" && !LOG.length){
+    const d = await api("/api/log");
+    LOG = d.rows || [];
+  }
+  render();
+});
+
+/* ── данные ───────────────────────────────────────────── */
+async function setKey(k, v){
+  tap();
+  const before = D[k];
+  D[k] = v;
+  if(k === "mode" || k === "mode_level" || k === "mode_bold" || k === "mode_emoji") render();
+  const r = await api("/api/set", {key:k, val:v});
+  if(r.error){ D[k] = before; toast("Не сохранилось"); return render() }
+  if(r.preview !== undefined){ D.preview = r.preview; const t = $("pvt"); if(t) t.innerHTML = r.preview }
+}
+
+async function addWord(el){
+  const w = el.value.trim(); if(!w) return;
+  el.value = ""; tap();
+  const r = await api("/api/words", {add:w});
+  if(r.words){ D.words = r.words; D.words_on = true; render(); toast("Добавлено") }
+}
+async function delWord(i){
+  tap();
+  const r = await api("/api/words", {del:i});
+  if(r.words){ D.words = r.words; render() }
+}
+
 async function load(){
- const d = await api("/api/state");
- if(d.error){document.body.innerHTML="<p>Открой это из чата с ботом 🙃</p>";return}
- s_media.textContent=d.media; s_caught.textContent=d.caught; s_pairs.textContent=d.pairs;
- mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold; emoji.checked = !!d.mode_emoji; when.value = d.save_when || "deleted";
- box.innerHTML = T.map(([k,t,dd])=>row(k,t,dd,d[k])).join("");
+  const d = await api("/api/state");
+  if(d.error){
+    document.body.innerHTML =
+      '<div class="empty">Открой это из чата с ботом 🙃</div>';
+    return;
+  }
+  D = d;
+  $("who").textContent = d.name || "Karzen Bot";
+  const c = $("conn");
+  c.textContent = d.connected ? "подключён" : "не подключён";
+  c.className = "badge " + (d.connected ? "on" : "off");
+  $("s_media").textContent = d.media;
+  $("s_caught").textContent = d.caught;
+  $("s_known").textContent = d.known;
+  $("s_trust").textContent = d.trusted;
+  render();
 }
-async function toggle(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
-async function setMode(v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:"mode",val:v}) }
-async function setKey(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
 load();
 </script></body></html>"""
 
@@ -1680,52 +2657,117 @@ async def page_app(request):
     return web.Response(text=MINI_APP, content_type="text/html")
 
 
+def web_user(request_body: dict) -> int | None:
+    return check_init_data(request_body.get("init", ""))
+
+
 async def api_state(request):
     body = await request.json()
-    uid = check_init_data(body.get("init", ""))
+    uid = web_user(body)
     if not uid:
         return web.json_response({"error": "bad signature"}, status=403)
     u = user(uid)
-    n, _ = st.media_stats(uid) if not asyncio.iscoroutinefunction(st.media_stats) \
-        else await st.media_stats(uid)
+    n, sz = await call(st.media_stats, uid)
+    known, trusted = st.counts(uid)
+    f = u["filter"]
     return web.json_response({
-        "mode": u["mode"], "antidelete": u["antidelete"],
+        "name": u.get("name") or "", "connected": conn_of(uid) is not None,
+        "mode": u["mode"] or "", "preview": preview(u["mode"], u),
         "mode_level": u.get("mode_level", "normal"), "mode_bold": u.get("mode_bold", True),
         "mode_emoji": u.get("mode_emoji", True),
-        "save_media": u["save_media"], "save_own": u["save_own"],
-        "save_when": u.get("save_when", "deleted"),
-        "track_edits": u.get("track_edits", True),
-        "scam": u["antiscam"]["enabled"], "filter": u["filter"]["enabled"],
-        "media": n, "caught": u["caught"], "pairs": len(u["pairs"]),
+        "antidelete": u["antidelete"], "save_media": u["save_media"],
+        "save_own": u["save_own"], "save_when": u.get("save_when", "deleted"),
+        "track_edits": u.get("track_edits", True), "digest": u.get("digest", False),
+        "scam": u["antiscam"]["enabled"], "new_dialog": u["antiscam"]["new_dialog"],
+        "unknown_bot": u["antiscam"]["unknown_bot"], "exec_files": u["antiscam"]["exec_files"],
+        "filter": f["enabled"], "filter_delete": f["delete"], "links": f["links"],
+        "numbers": f["numbers"], "buttons": f["buttons"], "words_on": f["words_on"],
+        "words": f["words"], "sens": u.get("sens", "normal"),
+        "quiet": u.get("quiet", ""), "away": u.get("away", ""),
+        "away_on": u.get("away_on", False),
+        "media": n, "media_size": human_size(sz), "caught": u["caught"],
+        "known": known, "trusted": trusted, "pairs": len(u["pairs"]),
     })
+
+
+#  Куда ложится ключ из мини-приложения: плоское имя → путь в настройках.
+WEB_KEYS = {
+    "scam": "antiscam.enabled", "new_dialog": "antiscam.new_dialog",
+    "unknown_bot": "antiscam.unknown_bot", "exec_files": "antiscam.exec_files",
+    "filter": "filter.enabled", "filter_delete": "filter.delete",
+    "links": "filter.links", "numbers": "filter.numbers",
+    "buttons": "filter.buttons", "words_on": "filter.words_on",
+    "antidelete": "antidelete", "save_media": "save_media", "save_own": "save_own",
+    "track_edits": "track_edits", "digest": "digest", "away_on": "away_on",
+    "mode_bold": "mode_bold", "mode_emoji": "mode_emoji",
+}
+WEB_ENUMS = {
+    "mode_level": LEVELS, "save_when": ("always", "deleted"), "sens": tuple(SENS),
+}
 
 
 async def api_set(request):
     body = await request.json()
-    uid = check_init_data(body.get("init", ""))
+    uid = web_user(body)
     if not uid:
         return web.json_response({"error": "bad signature"}, status=403)
     u, k, v = user(uid), body.get("key"), body.get("val")
+
     if k == "mode":
         u["mode"] = v if v in MODES else None
-    elif k == "mode_level":
-        u["mode_level"] = v if v in LEVELS else "normal"
-    elif k == "mode_bold":
-        u["mode_bold"] = bool(v)
-    elif k == "mode_emoji":
-        u["mode_emoji"] = bool(v)
-    elif k == "scam":
-        u["antiscam"]["enabled"] = bool(v)
-    elif k == "filter":
-        u["filter"]["enabled"] = bool(v)
-    elif k == "save_when":
-        u["save_when"] = v if v in ("always", "deleted") else "deleted"
-    elif k in ("antidelete", "save_media", "save_own", "track_edits"):
-        u[k] = bool(v)
+    elif k in WEB_ENUMS:
+        if v not in WEB_ENUMS[k]:
+            return web.json_response({"error": "bad value"}, status=400)
+        u[k] = v
+    elif k in WEB_KEYS:
+        dig_set(u, WEB_KEYS[k], bool(v))
+    elif k == "away":
+        u["away"] = str(v or "")[:800]
+    elif k == "quiet":
+        q = str(v or "").strip()
+        if q:
+            try:
+                a, b = q.split("-", 1)
+                hhmm(a), hhmm(b)
+            except Exception:
+                return web.json_response({"error": "bad time"}, status=400)
+        u["quiet"] = q
     else:
         return web.json_response({"error": "unknown key"}, status=400)
     save(uid)
-    return web.json_response({"ok": True})
+    #  Предпросмотр считает сервер: правила стиля живут только тут,
+    #  дублировать их в JS — гарантированно разъехаться.
+    return web.json_response({"ok": True, "preview": preview(u["mode"], u)})
+
+
+async def api_words(request):
+    body = await request.json()
+    uid = web_user(body)
+    if not uid:
+        return web.json_response({"error": "bad signature"}, status=403)
+    u = user(uid)
+    words = u["filter"]["words"]
+    add = (body.get("add") or "").strip().lower()[:40]
+    if add and add not in words:
+        words.append(add)
+        u["filter"]["words_on"] = True
+    if isinstance(body.get("del"), int) and 0 <= body["del"] < len(words):
+        words.pop(body["del"])
+    save(uid)
+    return web.json_response({"words": words})
+
+
+async def api_log(request):
+    body = await request.json()
+    uid = web_user(body)
+    if not uid:
+        return web.json_response({"error": "bad signature"}, status=403)
+    rows = [{"when": f"{ts_local(r['ts']):%d.%m %H:%M}", "peer": r["peer"],
+             "reason": r["reason"], "score": r["score"], "action": r["action"],
+             "text": (r["text"] or "")[:200]}
+            for r in st.recent_catches(uid, 30)]
+    return web.json_response({"rows": rows})
+
 
 
 async def setup_menu():
@@ -1764,30 +2806,36 @@ def users_page(page=0, per=8):
     rows, total = st.page(page * per, per)
     pages = max(1, (total + per - 1) // per)
     page = max(0, min(page, pages - 1))
-    if page * per != (page * per):
-        rows, total = st.page(page * per, per)
     lines = []
     for r in rows:
         badge = "⛔" if r["banned"] else ("🔌" if conn_of(r["uid"]) else "▫️")
-        un = f"@{r['username']}" if r["username"] else "—"
-        lines.append(f"{badge} <code>{r['uid']}</code> · {(r['name'] or '?')[:18]} · {un} "
+        un = f"@{esc(r['username'])}" if r["username"] else "—"
+        lines.append(f"{badge} <code>{r['uid']}</code> · {esc((r['name'] or '?')[:18])} · {un} "
                      f"· 🔪{r['caught']}")
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="‹", callback_data=f"adm:users:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="adm:noop"))
+        nav.append(B("‹", f"adm:users:{page - 1}"))
+    nav.append(B(f"{page + 1}/{pages}", "adm:noop"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="›", callback_data=f"adm:users:{page+1}"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        nav, [InlineKeyboardButton(text="‹ Админка", callback_data="adm:root")]])
-    return (f"👥 <b>Пользователи</b>\n\n{chr(10).join(lines) or 'пусто'}\n\n"
-            f"<i>/u id · /ban id · /unban id · /bc текст</i>"), kb
+        nav.append(B("›", f"adm:users:{page + 1}"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[nav, [B("‹ Админка", "adm:root")]])
+    return (f"👥 <b>Пользователи</b> · {total}\n\n{chr(10).join(lines) or 'пусто'}\n\n"
+            f"<i>/u id · /ban id · /unban id · /bc текст · /find кто</i>"), kb
+
+
+def top_page() -> str:
+    """Кто активнее всех — видно, ради чего бота вообще держат."""
+    rows, _ = st.page(0, 500)
+    top_caught = sorted(rows, key=lambda r: r["caught"], reverse=True)[:10]
+    lines = [f"{i + 1}. <code>{r['uid']}</code> · {esc((r['name'] or '?')[:18])} "
+             f"· 🔪 {r['caught']}" for i, r in enumerate(top_caught) if r["caught"]]
+    return "🏆 <b>Больше всех поймали</b>\n\n" + ("\n".join(lines) or "пока никто")
 
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
-    [InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users:0")],
-    [InlineKeyboardButton(text="‹ Назад", callback_data="m:root")],
+    [B("📊 Статистика", "adm:stats"), B("🏆 Топ", "adm:top")],
+    [B("👥 Пользователи", "adm:users:0")],
+    [B("‹ Меню", "n:root")],
 ])
 
 
@@ -1796,13 +2844,18 @@ async def admin_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Не для тебя 🙃", show_alert=True)
     p = cb.data.split(":")
-    if p[1] == "stats":
-        await cb.message.edit_text(stats_text(), reply_markup=ADMIN_KB)
-    elif p[1] == "users":
-        txt, kb = users_page(int(p[2]) if len(p) > 2 else 0)
-        await cb.message.edit_text(txt, reply_markup=kb)
-    elif p[1] != "noop":
-        await cb.message.edit_text("🛠 <b>Админка</b>", reply_markup=ADMIN_KB)
+    try:
+        if p[1] == "stats":
+            await cb.message.edit_text(stats_text(), reply_markup=ADMIN_KB)
+        elif p[1] == "top":
+            await cb.message.edit_text(top_page(), reply_markup=ADMIN_KB)
+        elif p[1] == "users":
+            txt, kb = users_page(int(p[2]) if len(p) > 2 else 0)
+            await cb.message.edit_text(txt, reply_markup=kb)
+        elif p[1] != "noop":
+            await cb.message.edit_text("🛠 <b>Админка</b>", reply_markup=ADMIN_KB)
+    except Exception:
+        pass
     await cb.answer()
 
 
@@ -1824,7 +2877,7 @@ async def cmd_u(m: Message):
     except ValueError:
         return await m.answer("Нужен числовой id.")
     await m.answer(
-        f"👤 <b>{u['name']}</b> (@{u['username'] or '—'})\n🆔 <code>{a[1]}</code>\n"
+        f"👤 <b>{esc(u['name'])}</b> (@{esc(u['username']) or '—'})\n🆔 <code>{esc(a[1])}</code>\n"
         f"🔌 Подключён: {'да' if conn_of(a[1]) else 'нет'}\n"
         f"⛔ Бан: {'да' if u['banned'] else 'нет'}\n"
         f"🛡 Антискам: {'вкл' if u['antiscam']['enabled'] else 'выкл'} · "
@@ -1846,8 +2899,8 @@ async def cmd_find(m: Message):
     if not rows:
         return await m.answer("Ничего не найдено.")
     await m.answer("🔎 <b>Найдено:</b>\n" + "\n".join(
-        f"• <code>{r['uid']}</code> · {(r['name'] or '?')[:20]} · "
-        f"@{r['username'] or '—'} · 🔪{r['caught']}" for r in rows))
+        f"• <code>{r['uid']}</code> · {esc((r['name'] or '?')[:20])} · "
+        f"@{esc(r['username']) or '—'} · 🔪{r['caught']}" for r in rows))
 
 
 @dp.message(Command("log"))
@@ -1856,17 +2909,57 @@ async def cmd_log(m: Message):
     target = m.from_user.id
     a = m.text.split()
     if len(a) > 1 and is_admin(m.from_user.id):
-        target = int(a[1])
-    rows = st.recent_catches(target, 10)
-    if not rows:
-        return await m.answer("📭 Пока ничего не поймано.")
-    out = []
-    for r in rows:
-        when = ts_local(r["ts"]).strftime("%d.%m %H:%M")
-        mark = "🗑" if r["action"] == "deleted" else "⚠️"
-        out.append(f"{mark} <b>{when}</b> · <code>{r['peer']}</code> · "
-                   f"{r['reason']} [{r['score']}]\n<i>{(r['text'] or '')[:90]}</i>")
-    await m.answer("🔪 <b>Последние срабатывания:</b>\n\n" + "\n\n".join(out))
+        try:
+            target = int(a[1])
+        except ValueError:
+            pass
+    txt, kb = await screen(target, "log", "0")
+    await m.answer(txt, reply_markup=kb)
+
+
+#  Остальные пункты из «/»: раньше они были в списке команд, но
+#  обработчиков к ним не существовало — бот молчал в ответ.
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(CMD_HELP, reply_markup=help_kb())
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message):
+    txt, kb = await screen(m.from_user.id, "root")
+    await m.answer(txt, reply_markup=kb)
+
+
+@dp.message(Command("media"))
+async def cmd_media(m: Message):
+    txt, kb = await screen(m.from_user.id, "arch")
+    await m.answer(txt, reply_markup=kb)
+
+
+@dp.message(Command("setup"))
+async def cmd_setup(m: Message):
+    txt, kb = await screen(m.from_user.id, "setup")
+    await m.answer(txt, reply_markup=kb)
+
+
+@dp.message(Command("export"))
+async def cmd_export(m: Message):
+    await m.answer("📤 Собираю выгрузку…")
+    await send_export(m.from_user.id)
+
+
+@dp.message(Command("invite"))
+async def cmd_invite(m: Message):
+    """Ссылка-приглашение. Кто пришёл по ней — виден в /me у пригласившего."""
+    me = await bot.get_me()
+    u = user(m.from_user.id, m.from_user)
+    link = f"https://t.me/{me.username}?start=ref_{m.from_user.id}"
+    await m.answer(
+        f"🔗 <b>Позвать друга</b>\n\n"
+        f"Перешли ему эту ссылку:\n{link}\n\n"
+        f"Пришло по твоей ссылке: <b>{u.get('invited', 0)}</b>\n\n"
+        f"<i>Бот бесплатный и работает без Premium — подключается за минуту "
+        f"через Настройки → Telegram для бизнеса → Чат-боты.</i>")
 
 
 @dp.message(Command("ban"))
@@ -1943,6 +3036,7 @@ ALLOWED_UPDATES = ["message", "callback_query", "business_connection",
 async def run_webhook():
     await storage_start()
     asyncio.create_task(st.flush_loop(5))
+    asyncio.create_task(digest_loop())
     dp.startup.register(on_startup)
     await setup_menu()
     app = web.Application()
@@ -1951,6 +3045,8 @@ async def run_webhook():
     app.router.add_get("/app", page_app)          # мини-приложение
     app.router.add_post("/api/state", api_state)
     app.router.add_post("/api/set", api_set)
+    app.router.add_post("/api/words", api_words)
+    app.router.add_post("/api/log", api_log)
     SimpleRequestHandler(dispatcher=dp, bot=bot,
                          secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
@@ -1967,6 +3063,7 @@ async def run_webhook():
 async def run_polling():
     await storage_start()
     asyncio.create_task(st.flush_loop(5))
+    asyncio.create_task(digest_loop())
     # если раньше стоял вебхук — снимаем, иначе Telegram не отдаст апдейты
     await bot.delete_webhook(drop_pending_updates=True)
     await setup_menu()
