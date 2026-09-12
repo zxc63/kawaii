@@ -129,7 +129,9 @@ USER_TPL = {
     "mode_bold": True,         # выделять твой текст жирным
     "mode_emoji": True,        # добавлять эмодзи под настроение режима
     "ref": 0,                  # кто пригласил (deep link)
-    "save_media": True,        # архивировать входящие медиа
+    "save_media": True,        # архивировать медиа вообще
+    "save_when": "deleted",    # deleted = только при удалении | always = сразу
+    "track_edits": True,       # ловить правки чужих сообщений
     "save_own": False,         # архивировать и свои тоже
     "antiscam": dict(ANTISCAM_TPL), "filter": dict(FILTER_TPL),
 }
@@ -630,7 +632,12 @@ def cache_put(m: Message):
         "chat": m.chat.id, "mid": m.message_id,
         "media": bool(m.photo or m.video or m.voice or m.video_note
                       or m.document or m.sticker or m.animation),
-        "uid": (media_of(m)[3] if media_of(m) else None),
+        "uid": (_mi[3] if (_mi := media_of(m)) else None),
+        "file_id": (_mi[2] if _mi else None),
+        "kind": (_mi[0] if _mi else None),
+        "size": (_mi[4] if _mi else 0),
+        "date": int(m.date.timestamp()) if m.date else int(time.time()),
+        "cid": m.business_connection_id,
     }
     while len(cache) > CACHE_LIMIT:
         cache.popitem(last=False)
@@ -649,9 +656,12 @@ async def on_deleted(ev: BusinessMessagesDeleted):
                 f"👤 {info['from']} (<code>{info['from_id']}</code>)")
         try:
             if info["media"]:
-                # копия обычно уже в архиве — тогда оригинал не нужен
+                u = user(owner_id)
                 if info.get("uid") and st.has_media(owner_id, info["uid"]):
                     head += "\n📦 <i>копия сохранена в архиве выше</i>"
+                elif u.get("save_media", True):
+                    # режим «сохранять при удалении» — вот он, момент
+                    head += await archive_from_cache(info, owner_id)
                 else:
                     try:
                         await bot.forward_message(c["chat"], info["chat"], info["mid"])
@@ -752,6 +762,100 @@ async def archive_media(m: Message, owner_id: int, forced=False) -> str | None:
     return f"📦 {kind} в архиве ({note})" if saved_id else f"⚠️ не вышло: {note}"
 
 
+async def archive_from_cache(info: dict, owner_id: int) -> str:
+    """Сохранить медиа удалённого сообщения по запомненному file_id.
+
+    Оригинала уже нет, поэтому copy_message не сработает — качаем
+    напрямую по file_id. Обычно файл ещё живёт на серверах Telegram
+    несколько минут после удаления. Со сгоревшими одноразовыми
+    так не выйдет: они стираются сразу.
+    """
+    c = conn_of(owner_id)
+    if not c or not info.get("file_id"):
+        return ""
+    kind, file_id = info["kind"], info["file_id"]
+    if st.has_media(owner_id, info.get("uid") or ""):
+        return "\n📦 <i>копия уже была в архиве</i>"
+    try:
+        data = (await bot.download(file_id)).read()
+        fname = f"{kind}_{info.get('uid')}"
+        file = BufferedInputFile(data, fname)
+        sender = {"photo": bot.send_photo, "video": bot.send_video,
+                  "voice": bot.send_voice, "video_note": bot.send_video_note,
+                  "animation": bot.send_animation, "audio": bot.send_audio,
+                  "sticker": bot.send_sticker}.get(kind, bot.send_document)
+        cap = (f"🗑📦 <b>{kind}</b> из удалённого\n"
+               f"👤 {info['from']} · {now_local():%d.%m %H:%M}")
+        kw = {"caption": cap} if kind not in ("video_note", "sticker") else {}
+        msg = await sender(c["chat"], file, **kw)
+        st.log_media(owner_id, info["chat"], info["from_id"], kind, file_id,
+                     info.get("uid") or "", info.get("size") or len(data),
+                     msg.message_id, "saved on delete")
+        return "\n📦 <i>медиа успело сохраниться</i>"
+    except Exception as ex:
+        logging.warning("archive_from_cache: %s", ex)
+        return (f"\n⚠️ <i>медиа не успело сохраниться "
+                f"({ex.__class__.__name__}) — вероятно, было одноразовым</i>")
+
+
+# ═════════════════════════════════════════════════════════
+#  ✏️ ПРАВКИ СООБЩЕНИЙ
+# ═════════════════════════════════════════════════════════
+#  Дыра, которая была: анти-делит ловил удаление, но не правку.
+#  Собеседник мог написать одно, а через минуту переписать на другое —
+#  и ты видел только вторую версию.
+def diff_line(old: str, new: str) -> str:
+    """Короткая пометка, что именно поменялось."""
+    if not old:
+        return "добавлен текст"
+    if not new:
+        return "текст убран"
+    if old.lower() == new.lower():
+        return "изменён регистр"
+    if new.startswith(old):
+        return f"дописано в конец (+{len(new) - len(old)})"
+    if old.startswith(new):
+        return f"обрезано (−{len(old) - len(new)})"
+    return "переписано"
+
+
+@dp.edited_business_message()
+async def on_edited(m: Message):
+    owner_id, c = owner_by_cid(m.business_connection_id)
+    if owner_id is None or m.sender_business_bot is not None:
+        return
+
+    key = (m.chat.id, m.message_id)
+    old = cache.get(key)
+    new_text = m.text or m.caption or ""
+
+    # свои правки не трогаем — и обновляем кэш, чтобы анти-делит
+    # сохранил актуальную версию
+    own = bool(m.from_user and m.from_user.id == owner_id)
+    if old:
+        old_text = old["text"]
+        old["text"] = new_text
+    else:
+        old_text = ""
+        cache_put(m)
+    if own:
+        return
+
+    u = user(owner_id)
+    if not u.get("track_edits", True) or not c:
+        return
+    if old_text == new_text:          # правка медиа/разметки без текста
+        return
+
+    who = m.from_user.full_name if m.from_user else "?"
+    await bot.send_message(
+        c["chat"],
+        f"✏️ <b>Сообщение изменено</b> · <i>{diff_line(old_text, new_text)}</i>\n"
+        f"👤 {who} (<code>{m.chat.id}</code>) · {now_local():%d.%m %H:%M}\n\n"
+        f"<b>Было:</b>\n<blockquote>{html_lib.escape(old_text or '—')[:700]}</blockquote>\n"
+        f"<b>Стало:</b>\n<blockquote>{html_lib.escape(new_text or '—')[:700]}</blockquote>")
+
+
 # ═════════════════════════════════════════════════════════
 #  РОУТЕР
 # ═════════════════════════════════════════════════════════
@@ -764,7 +868,8 @@ async def on_business_message(m: Message):
 
     if not (m.from_user and m.from_user.id == owner_id):
         await guard_incoming(m, owner_id)        # ← входящее: проверяем
-        asyncio.create_task(archive_media(m, owner_id))   # и архивируем медиа
+        if user(owner_id).get("save_when", "deleted") == "always":
+            asyncio.create_task(archive_media(m, owner_id))
         return
 
     u = user(owner_id, m.from_user)
@@ -774,7 +879,7 @@ async def on_business_message(m: Message):
     if not st.is_known(owner_id, m.chat.id):
         st.add_known(owner_id, m.chat.id)
 
-    if media_of(m):
+    if media_of(m) and u.get("save_when", "deleted") == "always":
         asyncio.create_task(archive_media(m, owner_id))
 
     text = m.text or ""
@@ -905,7 +1010,9 @@ CMD_HELP = """✨ <b>Команды</b> (префикс <code>.</code>)
 
 <b>Архив медиа</b> 📦
 <code>.save</code> — сохранить медиа (ответом)
-<code>.savemedia</code> — авто-архив вкл/выкл
+<code>.savemedia</code> — архив вкл/выкл
+<code>.savewhen always|deleted</code> — когда сохранять
+<code>.edits</code> — ловить правки чужих сообщений
 <code>.media</code> — что в архиве
 
 <b>Медиа</b> (ответом)
@@ -1075,6 +1182,28 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         await drop(m)
         res = await archive_media(target, uid, forced=True)
         return await dm(uid, res or "⚠️ нечего сохранять")
+
+    if name == "savewhen":
+        a = args.strip().lower()
+        if a in ("always", "сразу"):
+            u["save_when"] = "always"
+        elif a in ("deleted", "удаление"):
+            u["save_when"] = "deleted"
+        else:
+            return await note(
+                "📦 <code>.savewhen always</code> — сохранять сразу при получении\n"
+                "<code>.savewhen deleted</code> — только когда удалят\n\n"
+                f"Сейчас: <b>{u.get('save_when','deleted')}</b>\n\n"
+                "<i>При «deleted» архив чище, но одноразовые медиа могут "
+                "не успеть сохраниться — они стираются в момент просмотра.</i>")
+        save(uid)
+        return await note(f"📦 Сохранять: <b>{u['save_when']}</b>")
+
+    if name == "edits":
+        u["track_edits"] = not u["track_edits"]
+        save(uid)
+        return await note(f"✏️ Отслеживание правок: "
+                          f"{'вкл ✅' if u['track_edits'] else 'выкл ❌'}")
 
     if name == "savemedia":
         u["save_media"] = not u["save_media"]
@@ -1509,6 +1638,11 @@ MINI_APP = """<!doctype html><html><head><meta charset="utf-8">
    onchange="setKey('mode_bold',this.checked)"><span class="sl"></span></label></div>
 
 <h2>Сохранение</h2>
+<div class="row"><div><b>Когда сохранять медиа</b><small>«при удалении» — архив чище,
+ но одноразовые могут не успеть</small></div>
+  <select id="when" onchange="setKey('save_when',this.value)">
+    <option value="deleted">при удалении</option>
+    <option value="always">сразу</option></select></div>
 <div id="box"></div>
 <script>
 const tg = Telegram.WebApp; tg.ready(); tg.expand();
@@ -1516,6 +1650,7 @@ const T = [
  ["antidelete","Анти-делит","удалённые сообщения приходят тебе"],
  ["save_media","Архив медиа","копии фото, видео и голосовых"],
  ["save_own","Свои медиа","архивировать и то, что шлёшь сам"],
+ ["track_edits","Правки сообщений","показывать «было → стало»"],
  ["scam","Антискам","проверка первых сообщений"],
  ["filter","Фильтр спама","удалять подозрительное автоматически"],
 ];
@@ -1531,7 +1666,7 @@ async function load(){
  const d = await api("/api/state");
  if(d.error){document.body.innerHTML="<p>Открой это из чата с ботом 🙃</p>";return}
  s_media.textContent=d.media; s_caught.textContent=d.caught; s_pairs.textContent=d.pairs;
- mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold; emoji.checked = !!d.mode_emoji;
+ mode.value = d.mode || ""; level.value = d.mode_level || "normal"; bold.checked = !!d.mode_bold; emoji.checked = !!d.mode_emoji; when.value = d.save_when || "deleted";
  box.innerHTML = T.map(([k,t,dd])=>row(k,t,dd,d[k])).join("");
 }
 async function toggle(k,v){ tg.HapticFeedback.impactOccurred("light"); await api("/api/set",{key:k,val:v}) }
@@ -1558,6 +1693,8 @@ async def api_state(request):
         "mode_level": u.get("mode_level", "normal"), "mode_bold": u.get("mode_bold", True),
         "mode_emoji": u.get("mode_emoji", True),
         "save_media": u["save_media"], "save_own": u["save_own"],
+        "save_when": u.get("save_when", "deleted"),
+        "track_edits": u.get("track_edits", True),
         "scam": u["antiscam"]["enabled"], "filter": u["filter"]["enabled"],
         "media": n, "caught": u["caught"], "pairs": len(u["pairs"]),
     })
@@ -1581,7 +1718,9 @@ async def api_set(request):
         u["antiscam"]["enabled"] = bool(v)
     elif k == "filter":
         u["filter"]["enabled"] = bool(v)
-    elif k in ("antidelete", "save_media", "save_own"):
+    elif k == "save_when":
+        u["save_when"] = v if v in ("always", "deleted") else "deleted"
+    elif k in ("antidelete", "save_media", "save_own", "track_edits"):
         u[k] = bool(v)
     else:
         return web.json_response({"error": "unknown key"}, status=400)
