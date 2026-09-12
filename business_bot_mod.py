@@ -21,7 +21,7 @@
   🌙 ТИШИНА — уведомления беззвучно в заданные часы
   💤 АВТООТВЕТ — «я отошёл» на первое сообщение
   📬 СВОДКА — итоги дня одним сообщением
-  🎬 МЕДИА — .gif .fv .lq .story .nk .type
+  🎬 МЕДИА — .gif .fv .lq .story .type · картинки .nk .nkb
   🎲 МЕЛОЧИ — .pick .8ball .roll .zalgo .space …
   🛠 АДМИНКА — статистика, список юзеров, бан, рассылка
 
@@ -1221,6 +1221,106 @@ def to_stories(data: bytes):
 
 
 # ═════════════════════════════════════════════════════════
+#  🐾 КАРТИНКИ ИЗ ИНТЕРНЕТА
+# ═════════════════════════════════════════════════════════
+#  Источники падают поодиночке и без предупреждения, поэтому у каждой
+#  категории их несколько: первый, отдавший настоящую картинку, выигрывает.
+_http: aiohttp.ClientSession | None = None
+
+
+async def http() -> aiohttp.ClientSession:
+    """Одна сессия на весь процесс. Новый ClientSession на каждую
+    картинку — это лишний TCP- и TLS-хендшейк на ровном месте."""
+    global _http
+    if _http is None or _http.closed:
+        #  Картинки бывают по 3 МБ: 15 секунд на всё — уже впритык,
+        #  а вот коннект должен отваливаться быстро, чтобы успеть
+        #  сходить к запасному источнику.
+        _http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=25, connect=8))
+    return _http
+
+
+async def http_close():
+    if _http and not _http.closed:
+        await _http.close()
+
+
+NEKO = {
+    #  вид: (подпись, источники по порядку)
+    "neko": ("ня~ ♡ (=^･ω･^=)", ["https://nekos.best/api/v2/neko",
+                                 "https://nekos.best/api/v2/kitsune"]),
+    "kitsune": ("лисичка ♡ ʕ•ᴥ•ʔ", ["https://nekos.best/api/v2/kitsune",
+                                     "https://nekos.best/api/v2/neko"]),
+    "waifu": ("вайфу ♡ (◕‿◕✿)", ["https://nekos.best/api/v2/waifu",
+                                 "https://nekos.best/api/v2/neko"]),
+    "husbando": ("кун ♡ (￣ω￣)", ["https://nekos.best/api/v2/husbando",
+                                  "https://api.catboys.com/img"]),
+    "catboy": ("котик ♡ ヽ(=^･ω･^=)丿", ["https://api.catboys.com/img",
+                                        "https://nekos.best/api/v2/husbando"]),
+}
+NEKO_ALIAS = {                         # что можно написать после .nk
+    "neko": "neko", "нэко": "neko", "неко": "neko", "ня": "neko",
+    "kitsune": "kitsune", "лиса": "kitsune", "лисичка": "kitsune",
+    "waifu": "waifu", "вайфу": "waifu", "ж": "waifu", "девушка": "waifu",
+    "husbando": "husbando", "boy": "husbando", "b": "husbando",
+    "м": "husbando", "кун": "husbando", "парень": "husbando",
+    "catboy": "catboy", "кот": "catboy", "котик": "catboy", "некомими": "catboy",
+}
+MAX_PIC = 10 * 1024 * 1024             # потолок Telegram на фото
+IMG_MAGIC = ((b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"),
+             (b"GIF8", "gif"), (b"RIFF", "webp"))
+
+
+def img_ext(data: bytes) -> str | None:
+    """Расширение по сигнатуре файла. Лёгший API обожает ответить
+    HTML-страницей с кодом 200 — без этой проверки она уедет как «фото»."""
+    for sig, ext in IMG_MAGIC:
+        if data.startswith(sig):
+            return ext
+    return None
+
+
+def pic_url(j) -> str | None:
+    """У каждого API свой формат ответа — вытаскиваем ссылку из любого."""
+    if not isinstance(j, dict):
+        return None
+    for path in (("url",), ("image",), ("results", 0, "url")):
+        node = j
+        for key in path:
+            if isinstance(key, int):
+                node = node[key] if isinstance(node, list) and len(node) > key else None
+            else:
+                node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, str) and node.startswith("http"):
+            return node
+    return None
+
+
+async def fetch_pic(sources) -> tuple[bytes, str] | None:
+    """→ (байты, расширение) с первого живого источника или None."""
+    s = await http()
+    for api in sources:
+        try:
+            async with s.get(api) as r:
+                url = pic_url(await r.json(content_type=None))
+            if not url:
+                continue
+            async with s.get(url) as r:
+                if int(r.headers.get("Content-Length") or 0) > MAX_PIC:
+                    continue
+                data = await r.read()
+            ext = img_ext(data)
+            if ext and len(data) <= MAX_PIC:
+                return data, ext
+        except Exception as ex:
+            logging.info("pic %s: %s", api, ex.__class__.__name__)
+    return None
+
+
+# ═════════════════════════════════════════════════════════
 #  КОМАНДЫ
 # ═════════════════════════════════════════════════════════
 #  Справка разбита по темам: одним полотном её никто не читает,
@@ -1273,8 +1373,12 @@ HELP = {
 <code>.fv</code> — голосовое громче и чище
 <code>.lq</code> — зашакалить фото
 <code>.story</code> — фото → нарезка под сторис
-<code>.nk</code> — случайная неко-картинка
-<code>.type</code> — печатать текст по буквам"""),
+<code>.type</code> — печатать текст по буквам
+
+<b>Картинки</b>
+<code>.nk</code> — неко · <code>.nkb</code> — кун
+<code>.nk лиса</code> <code>.nk вайфу</code> <code>.nk кот</code>
+<i>если источник лежит, бот сам идёт к следующему</i>"""),
 
     "fun": ("🎲", "Мелочи", """🎲 <b>Мелочи</b>
 
@@ -1633,18 +1737,28 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         return await send_export(uid)
 
     # ── медиа ──
-    if name == "nk":
+    #  Источники пробуем по очереди: если первый лёг или отдал мусор,
+    #  идём к следующему, и только потом сдаёмся.
+    if name in ("nk", "nkb"):
+        a = args.strip().lower()
+        if a and a not in NEKO_ALIAS:
+            return await note("🐾 <code>.nk</code> — неко · <code>.nkb</code> — кун\n"
+                              "Ещё: " + " ".join(f"<code>.nk {k}</code>" for k in
+                                                 ("лиса", "вайфу", "кот")))
+        kind = NEKO_ALIAS.get(a) or ("husbando" if name == "nkb" else "neko")
+        cap, sources = NEKO[kind]
         await drop(m)
+        got = await fetch_pic(sources)
+        if not got:
+            return await dm(uid, "😿 Источники картинок молчат — попробуй позже.")
+        data, ext = got
+        #  gif как фото уходит стоп-кадром — анимации свой метод
+        sender = bot.send_animation if ext == "gif" else bot.send_photo
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get("https://nekos.best/api/v2/neko") as r:
-                    url = (await r.json())["results"][0]["url"]
-                async with s.get(url) as r:
-                    img = await r.read()
-            await bot.send_photo(m.chat.id, BufferedInputFile(img, "neko.png"),
-                                 caption="ня~ ♡", business_connection_id=cid)
+            await sender(m.chat.id, BufferedInputFile(data, f"{kind}.{ext}"),
+                         caption=cap, business_connection_id=cid)
         except Exception as ex:
-            await dm(uid, f"⚠️ .nk: {ex}")
+            await dm(uid, f"⚠️ .{name}: {ex}")
         return
 
     if name in ("gif", "fv", "lq", "story"):
@@ -1734,7 +1848,7 @@ KNOWN_CMDS = sorted({
     "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
-    "nk", "gif", "fv", "lq", "story", "pair", "unpair", "pairs",
+    "nk", "nkb", "gif", "fv", "lq", "story", "pair", "unpair", "pairs",
     "zalgo", "space", "upside", *MODES,
 })
 
@@ -3080,6 +3194,7 @@ async def main():
             await run_polling()
     finally:
         await storage_stop()      # дописать хвост перед выходом
+        await http_close()
 
 
 if __name__ == "__main__":
