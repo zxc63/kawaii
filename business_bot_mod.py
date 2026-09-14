@@ -24,7 +24,6 @@
   🎬 МЕДИА — .gif .fv .lq .story .type · картинки .nk .nkb
             · гифки-реакции .g обнять / .g погладить
   🎲 МЕЛОЧИ — .pick .8ball .roll .zalgo .space …
-  🕵️ OSINT — .dox (кэш чата) · .osint (кэш + API + userbot)
   🛠 АДМИНКА — статистика, список юзеров, бан, рассылка
 
     pip install aiogram pillow aiohttp     (+ ffmpeg в системе)
@@ -1016,121 +1015,6 @@ async def archive_from_cache(info: dict, owner_id: int) -> str:
                 f"({ex.__class__.__name__}) — вероятно, было одноразовым</i>")
 
 
-# =================================================================
-#  OSINT SEARCH · local cache + external APIs + optional userbot
-# -----------------------------------------------------------------
-#  .dox    — search the CURRENT dialog's cache (text, sender, id)
-#  .osint  — search ALL cached chats + external APIs + userbot
-# =================================================================
-
-# External OSINT endpoints: (name, url_template, json_path)
-# url_template must contain {query}. json_path is a dot-separated
-# path to the list of results inside the JSON body ("" = root).
-OSINT_ENDPOINTS: list = [
-    # ("telegramdb", "https://api.example.com/search?q={query}", "results"),
-    # ("leakcheck",  "https://leakcheck.io/api/public?check={query}", "result"),
-]
-
-# Optional Telethon userbot — imported silently; absence is not fatal.
-try:
-    from userbot import userbot_client as _osint_userbot
-    TELETHON_AVAILABLE = True
-except Exception:
-    _osint_userbot = None
-    TELETHON_AVAILABLE = False
-
-
-async def osint_external(query: str) -> list:
-    """Query every configured OSINT HTTP API. Dead sources are skipped."""
-    if not OSINT_ENDPOINTS:
-        return []
-    s = await http()
-    out = []
-    for name, tpl, path in OSINT_ENDPOINTS:
-        url = tpl.format(query=query)
-        try:
-            async with s.get(url) as r:
-                if r.status != 200:
-                    continue
-                data = await r.json(content_type=None)
-            node = data
-            for key in path.split("."):
-                if not key:
-                    continue
-                node = node.get(key) if isinstance(node, dict) else None
-                if node is None:
-                    break
-            if isinstance(node, list):
-                for item in node[:10]:
-                    out.append({"source": name, "data": item})
-        except Exception as ex:
-            logging.info("osint %s: %s", name, ex.__class__.__name__)
-    return out
-
-
-async def osint_telethon(query: str, per_dialog: int = 5) -> list:
-    """Search every dialog the userbot can see. Returns [] on any failure."""
-    if not TELETHON_AVAILABLE or _osint_userbot is None:
-        return []
-    try:
-        dialogs = await _osint_userbot.get_dialogs()
-    except Exception as ex:
-        logging.warning("osint telethon dialogs: %s", ex)
-        return []
-    out = []
-    for d in dialogs:
-        try:
-            async for msg in _osint_userbot.iter_messages(
-                    d.entity, search=query, limit=per_dialog):
-                src = getattr(msg, "from_user", None)
-                out.append({
-                    "dialog": getattr(d, "name", "") or "",
-                    "dialog_id": getattr(d, "id", 0),
-                    "from": (getattr(src, "first_name", "")
-                             or getattr(src, "title", "") or ""),
-                    "from_id": getattr(src, "id", 0) or 0,
-                    "date": int(msg.date.timestamp()) if msg.date else 0,
-                    "text": msg.text or msg.caption or "",
-                })
-        except Exception:
-            continue
-    return out
-
-
-def osint_search_cache(query: str, chat_filter=None, limit: int = 30) -> list:
-    """Search the in-memory message cache. chat_filter=None → all chats."""
-    ql = query.lower()
-    hits = []
-    for (chat, _mid), info in cache.items():
-        if chat_filter is not None and chat != chat_filter:
-            continue
-        text = (info.get("text") or "").lower()
-        sender = (info.get("from") or "").lower()
-        sid = str(info.get("from_id") or "")
-        if ql in text or ql in sender or ql == sid:
-            item = dict(info)
-            item["_chat"] = chat
-            hits.append(item)
-    hits.sort(key=lambda x: x.get("date", 0), reverse=True)
-    return hits[:limit]
-
-
-def fmt_osint_hits(hits: list, q: str, total: int) -> str:
-    """Common formatting for .dox and .osint local results."""
-    lines = [f"🔍 <b>{esc(q)}</b> · найдено {total}"]
-    for info in hits:
-        dt = ts_local(info["date"]).strftime("%d.%m %H:%M")
-        snip = (info.get("text") or "").replace("\n", " ")[:140]
-        chat_tag = ""
-        if info.get("_chat"):
-            chat_tag = f" · чат <code>{info['_chat']}</code>"
-        lines.append(
-            f"• <b>{esc(info['from'])}</b> (<code>{info['from_id']}</code>)"
-            f" · {dt}{chat_tag}\n  <i>{esc(snip)}</i>")
-    body = "\n".join(lines)
-    return body[:4000] + ("…" if len(body) > 4000 else "")
-
-
 # ═════════════════════════════════════════════════════════
 #  ✏️ ПРАВКИ СООБЩЕНИЙ
 # ═════════════════════════════════════════════════════════
@@ -1570,17 +1454,6 @@ HELP = {
 <code>.g обнять</code> <code>.g погладить</code> <code>.g поцелуй</code> <code>.g бонк</code>
 <code>.g</code> — случайная · <code>.g список</code> — все
 <i>ответом на сообщение гифка уходит ответом</i>"""),
-
-    "osint": ("🕵️", "Поиск", """🕵️ <b>Поиск и OSINT</b>
-
-<code>.dox запрос</code> — поиск по кэшу этого диалога
-<code>.osint запрос</code> — поиск везде (кэш + API + userbot)
-<code>.osint local запрос</code> — только локальный кэш
-<code>.osint apis запрос</code> — только внешние источники
-
-<i>Кэш — до 8000 последних сообщений, которые бот видел во всех
-диалогах. Внешние API настраиваются в OSINT_ENDPOINTS в коде,
-userbot — файлом <code>userbot.py</code> рядом со скриптом.</i>"""),
 
     "fun": ("🎲", "Мелочи", """🎲 <b>Мелочи</b>
 
@@ -2078,74 +1951,6 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         return await note("🤝 <b>Пары:</b>\n" + "\n".join(
             f"• <code>{k}</code> — <b>{v}</b>" for k, v in u["pairs"].items()))
 
-    # ── OSINT ──
-    if name == "dox":
-        q = args.strip()
-        if not q:
-            return await note(
-                "🔍 <code>.dox запрос</code>\n\n"
-                "Поиск по кэшу <b>этого диалога</b>: текст, имя, id.\n"
-                "Ищет до 8000 последних сообщений, которые бот видел.\n"
-                "Для более широкого поиска — <code>.osint</code>.")
-        hits = osint_search_cache(q, chat_filter=peer, limit=25)
-        if not hits:
-            return await note(f"🔍 <code>{esc(q)}</code> — в этом чате ничего.")
-        await drop(m)
-        return await dm(uid, fmt_osint_hits(hits, q, len(hits)))
-
-    if name == "osint":
-        raw_args = args.strip()
-        if not raw_args:
-            return await note(
-                "🕵️ <code>.osint [local|apis|all] запрос</code>\n\n"
-                "<b>Источники:</b>\n"
-                "• <code>local</code> — кэш всех чатов\n"
-                "• <code>apis</code> — внешние API и userbot\n"
-                "• <code>all</code> — всё вместе (по умолчанию)\n\n"
-                f"Внешних API: <b>{len(OSINT_ENDPOINTS)}</b> · "
-                f"userbot: <b>{'да' if TELETHON_AVAILABLE else 'нет'}</b>\n\n"
-                "<i>Внешние источники задаются в OSINT_ENDPOINTS в коде, "
-                "userbot подключается файлом userbot.py рядом со скриптом.</i>")
-        scope, _, rest = raw_args.partition(" ")
-        if scope in ("local", "apis", "all") and rest.strip():
-            q = rest.strip()
-        else:
-            scope, q = "all", raw_args
-        if not q:
-            return await note("🤔 Пустой запрос.")
-        await drop(m)
-
-        local_hits = (osint_search_cache(q, limit=30)
-                      if scope in ("all", "local") else [])
-        ext = await osint_external(q) if scope in ("all", "apis") else []
-        tel = await osint_telethon(q) if scope in ("all", "apis") else []
-
-        blocks = []
-        if local_hits:
-            blocks.append(fmt_osint_hits(local_hits, q, len(local_hits)))
-        if tel:
-            tel_lines = [f"🌐 <b>Telegram dialogs</b> · {len(tel)}"]
-            for r in tel[:15]:
-                dt = ts_local(r["date"]).strftime("%d.%m %H:%M") if r["date"] else "—"
-                snip = (r.get("text") or "").replace("\n", " ")[:120]
-                tel_lines.append(
-                    f"• [{esc(r['dialog'])}] {esc(r['from'])} "
-                    f"(<code>{r['from_id']}</code>) · {dt}\n  <i>{esc(snip)}</i>")
-            blocks.append("\n".join(tel_lines))
-        if ext:
-            ext_lines = [f"🔗 <b>External APIs</b> · {len(ext)}"]
-            for r in ext[:15]:
-                ext_lines.append(
-                    f"• <b>{esc(r['source'])}</b>: "
-                    f"<code>{esc(str(r['data'])[:200])}</code>")
-            blocks.append("\n".join(ext_lines))
-
-        if not blocks:
-            return await dm(uid, f"🕵️ <code>{esc(q)}</code> — ничего не найдено.")
-        body = (f"🕵️ <b>OSINT</b> · <code>{esc(q)}</code> · scope: <b>{scope}</b>\n\n"
-                + "\n\n".join(blocks))
-        return await dm(uid, body[:4000] + ("…" if len(body) > 4000 else ""))
-
     # ── команды нет ──
     #  Молчать нельзя: команда уже улетела собеседнику как обычный текст,
     #  и человек должен понять, почему ничего не произошло.
@@ -2160,7 +1965,6 @@ KNOWN_CMDS = sorted({
     "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
-    "dox", "osint",
     "nk", "nkb", "nkg", "g", "гиф", "gif", "fv", "lq", "story",
     "pair", "unpair", "pairs",
     "zalgo", "space", "upside", *MODES,
