@@ -100,7 +100,7 @@ WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-please")
 WEBHOOK_PATH = "/tg/webhook"
-ADMINS = [6958994529]              # <-- твой telegram id
+ADMINS = [123456789]              # <-- твой telegram id
 PREFIX = "."
 DB_FILE = "bot.db"
 CACHE_LIMIT = 8000
@@ -1460,6 +1460,7 @@ HELP = {
 <code>.pick а | б | в</code> — выбрать за тебя
 <code>.roll 2d6</code> · <code>.dice</code> · <code>.flip</code>
 <code>.8ball вопрос</code> — шар предсказаний
+<code>.nuke</code> — «удалить чат» понарошку · <code>.nuke своя концовка</code>
 <code>.love</code> · <code>.me</code> — про себя
 <code>/invite</code> — позвать друга · <code>/setup</code> — как подключить"""),
 }
@@ -1481,6 +1482,27 @@ def help_kb(active: str = "") -> InlineKeyboardMarkup:
         rows.append(line)
     rows.append([InlineKeyboardButton(text="‹ Меню", callback_data="n:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+#  Кадры для .nuke — что «происходит», пока ползёт прогресс,
+#  и чем всё заканчивается. Концовка обязательна: без неё это не мем,
+#  а повод для паники.
+NUKE_STEPS = [
+    "стираю переписку…", "выношу компромат…", "жгу улики…",
+    "удаляю мемы… больно…", "чищу голосовые, записанные в три ночи…",
+    "забываю всё, что ты писал…", "отправляю стикеры в небытие…",
+    "удаляю «привет, как дела» ×247…", "вычёркиваю тебя из истории…",
+    "распечатываю и рву…", "прошу Дурова забыть этот чат…",
+    "стираю «ок» ×1 024…",
+]
+NUKE_PUNCH = [
+    "…шучу 😼 всё на месте.",
+    "…ладно, ничего не удалено. Но страшно же было?",
+    "…нет. Я всё сохраню. Навсегда. ♡",
+    "…расслабься, это просто мем 🗿",
+    "…упс, кнопка «отмена» была рядом. Всё цело.",
+    "…а вот и нет. Даже тот стикер.",
+]
 
 
 async def handle_cmd(m: Message, uid: int, raw: str):
@@ -1768,6 +1790,42 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             await dm(uid, f"⚠️ .type: {ex}")
         return
 
+    if name in ("nuke", "wipe", "delchat", "удалить"):
+        #  Шуточное «удаление чата»: одно сообщение, которое правится кадр
+        #  за кадром — прогресс, фальшивая статистика, «удалено», и в конце
+        #  обязательное признание. НИЧЕГО не удаляется: это мем, и последний
+        #  кадр всегда это раскрывает, чтобы собеседник не побежал в поддержку.
+        punch = html_lib.escape(args.strip()[:200]) or random.choice(NUKE_PUNCH)
+        await drop(m)
+        try:
+            sent = await bot.send_message(m.chat.id, "🗑 <b>Удаление чата…</b>",
+                                          business_connection_id=cid)
+        except Exception as ex:
+            return await dm(uid, f"⚠️ .{name}: {ex}")
+
+        async def frame(text: str, pause: float = 0.5):
+            try:
+                await bot.edit_message_text(text, chat_id=m.chat.id,
+                                            message_id=sent.message_id,
+                                            business_connection_id=cid)
+            except Exception:
+                pass
+            await asyncio.sleep(pause)
+
+        steps = random.sample(NUKE_STEPS, 4)
+        for i, step in enumerate(steps, 1):
+            pct = int(i / (len(steps) + 1) * 100)
+            filled = pct // 10
+            await frame(f"🗑 <b>Удаление чата…</b>\n"
+                        f"{'▰' * filled}{'▱' * (10 - filled)} {pct}%\n<i>{step}</i>")
+        msgs = f"{random.randint(800, 9000):,}".replace(",", " ")
+        gb = random.randint(11, 97) / 10
+        await frame(f"🗑 <b>Удаление чата…</b>\n{'▰' * 10} 100%\n"
+                    f"<i>удалено {msgs} сообщений · освобождено {gb} ГБ мемов</i>", 0.8)
+        await frame("✅ <b>Чат удалён.</b>", 1.2)
+        await frame(f"✅ <s>Чат удалён.</s>\n\n{punch}", 0)
+        return
+
     # ── архив ──
     if name == "save":
         target = rep or m
@@ -1964,10 +2022,11 @@ KNOWN_CMDS = sorted({
     "scam", "filter", "sens", "trust", "untrust", "mute", "unmute", "check",
     "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
+    "nuke", "wipe", "delchat", "удалить",
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
     "nk", "nkb", "nkg", "g", "гиф", "gif", "fv", "lq", "story",
     "pair", "unpair", "pairs",
-    "zalgo", "space", "upside", *MODES,
+    "zalgo", "space", "upside", "fdc", *MODES,
 })
 
 
