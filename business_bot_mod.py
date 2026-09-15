@@ -15,6 +15,7 @@
 Блоки:
   🛡 АНТИСКАМ — детект развода на первом контакте, уведомления
   🔪 ФИЛЬТР  — автоудаление подозрительных первых сообщений
+  🕵️ АНТИ-ДОКС — команда «dox/пробив» и выкладка за ней удаляются
   🗑 АНТИ-ДЕЛИТ — сохраняет удалённые сообщения и правки
   🌸 МОДЫ — kawaii / tsundere / yandere / leet / small / bubble / mock
             + совместный мод и мод на конкретный диалог
@@ -128,6 +129,13 @@ FILTER_TPL = {
     "words_on": False,
     "words": [],
 }
+ANTIDOX_TPL = {
+    "enabled": True,
+    "dry_run": True,           # только докладывать, ничего не удалять
+    "arm": 4.0,                # секунд ждать «выкладку» после команды
+    "quarantine": 0,           # минут удалять от него всё после срабатывания, 0 = выкл
+    "triggers": 0, "killed": 0, "missed": 0,
+}
 USER_TPL = {
     "name": "", "username": "", "first_seen": 0, "last_seen": 0,
     "banned": False, "cmds": 0, "caught": 0,
@@ -150,6 +158,7 @@ USER_TPL = {
     "away_on": False,
     "digest": False,           # сводка за день в 21:00
     "antiscam": dict(ANTISCAM_TPL), "filter": dict(FILTER_TPL),
+    "antidox": dict(ANTIDOX_TPL),
 }
 
 
@@ -807,6 +816,7 @@ async def on_connect(bc: BusinessConnection):
                 miss.append("удалять отправленные (для модов)")
             if not r.can_delete_all_messages:
                 miss.append("удалять любые (для автоудаления скама)")
+            _can_delete_all[uid] = bool(r.can_delete_all_messages)   # для анти-докса
         warn = ("\n\n⚠️ <b>Не выданы права:</b> " + ", ".join(miss) +
                 "\nДобавь их там же, где подключал — иначе часть функций молчит.") if miss else ""
         await bot.send_message(
@@ -889,6 +899,121 @@ async def on_deleted(ev: BusinessMessagesDeleted):
         except Exception as ex:
             logging.warning("antidelete: %s", ex)
 
+
+# ═════════════════════════════════════════════════════════
+#  🕵️ АНТИ-ДОКС
+# ═════════════════════════════════════════════════════════
+#  Схема «докс-ботов»: первым сообщением уходит команда (dox / пробив /
+#  doxbin …), следом — сама выкладка. Поэтому две стадии:
+#    1) команда — удаляем сразу и «взводим» наблюдателя;
+#    2) следующее сообщение от того же человека в течение окна — удаляем,
+#       каким бы оно ни было: это и есть полезная нагрузка.
+#  Правку тоже ловим: команду могут дописать в уже отправленное сообщение.
+#
+#  Изначально модуль был написан под Telethon (юзербот). Здесь Bot API,
+#  и это меняет три вещи:
+#    · заблокировать человека бот не может (нет BlockRequest) — вместо
+#      этого «карантин»: N минут удаляем от него вообще всё;
+#    · право «удалять любые сообщения» не спрашивают у чата
+#      (get_permissions) — оно известно из bc.rights при подключении;
+#    · отчёт уходит не в «Избранное», а сюда, в чат с ботом, с кнопками
+#      «доверять / заглушить» как у остальных уведомлений.
+#  По умолчанию DRY-RUN: сначала посмотри на отчёты, потом включай боевой.
+DOX_TRIGGER = re.compile(
+    r"^[./!,#$]?\s*(dox|doxp|doxbin|dox3|пробив|probiv|деанон|deanon)\b",
+    re.IGNORECASE)
+_dox_armed: dict[tuple[int, int], float] = {}        # (owner, peer) → дедлайн
+_dox_quarantine: dict[tuple[int, int], float] = {}   # (owner, peer) → до когда
+_can_delete_all: dict[int, bool] = {}                # owner → право из bc.rights
+
+
+def adox(u: dict) -> dict:
+    """Настройки анти-докса юзера. setdefault — на случай старых записей,
+    у которых ключа ещё нет."""
+    return u.setdefault("antidox", dict(ANTIDOX_TPL))
+
+
+async def dox_kill(m: Message, owner_id: int, reason: str, t0: float):
+    """Удалить (или сделать вид — в DRY-RUN) и доложить владельцу."""
+    u = user(owner_id)
+    d = adox(u)
+    peer = m.chat.id
+    text = m.text or m.caption or ""
+
+    if d.get("dry_run", True):
+        status_, deleted = "DRY-RUN · не удаляю", False
+    elif _can_delete_all.get(owner_id) is False:
+        status_, deleted = "нет права «удалять любые сообщения»", False
+        d["missed"] = d.get("missed", 0) + 1
+    else:
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=m.business_connection_id,
+                message_ids=[m.message_id])
+            status_ = f"удалено · {(time.monotonic() - t0) * 1000:.0f} мс"
+            deleted = True
+            d["killed"] = d.get("killed", 0) + 1
+        except Exception as ex:
+            status_, deleted = f"не вышло: {ex.__class__.__name__}", False
+            d["missed"] = d.get("missed", 0) + 1
+    save(owner_id)
+    st.log_catch(owner_id, peer, 0, f"анти-докс: {reason}", text,
+                 "deleted" if deleted else "notified")
+    await dm(owner_id,
+             f"🕵️ <b>Анти-докс</b> · {status_}\n"
+             f"🎯 {reason} · 👤 <code>{peer}</code>\n\n"
+             f"<blockquote>{esc(text[:400]) or '(без текста)'}</blockquote>",
+             reply_markup=peer_kb(peer, u))
+
+
+async def antidox_check(m: Message, owner_id: int, edited: bool = False) -> bool:
+    """→ True, если сообщение — часть докс-атаки и уже обработано."""
+    t0 = time.monotonic()
+    u = user(owner_id)
+    d = adox(u)
+    if not d.get("enabled", True):
+        return False
+    peer = m.chat.id
+    if peer == owner_id or st.is_trusted(owner_id, peer):
+        return False
+    key = (owner_id, peer)
+    now = time.time()
+
+    # карантин: после срабатывания какое-то время валим от него всё
+    until = _dox_quarantine.get(key)
+    if until:
+        if now < until:
+            _dox_armed.pop(key, None)        # выкладка тоже сюда попала — снимаем
+            await dox_kill(m, owner_id, "карантин", t0)
+            return True
+        _dox_quarantine.pop(key, None)
+
+    # стадия 2: наблюдатель взведён → следующее сообщение и есть выкладка
+    deadline = _dox_armed.pop(key, None)
+    if deadline is not None and now < deadline:
+        await dox_kill(m, owner_id, "выкладка после команды", t0)
+        return True
+
+    # стадия 1: сама команда
+    if DOX_TRIGGER.match(m.text or m.caption or ""):
+        _dox_armed[key] = now + float(d.get("arm", 4.0))
+        d["triggers"] = d.get("triggers", 0) + 1
+        if d.get("quarantine", 0):
+            _dox_quarantine[key] = now + float(d["quarantine"]) * 60
+        await dox_kill(m, owner_id, "команда (правкой)" if edited else "команда", t0)
+        return True
+    return False
+
+
+def dox_status(u: dict) -> str:
+    d = adox(u)
+    return (f"🕵️ <b>Анти-докс</b> · {'вкл' if d.get('enabled', True) else 'выкл'}\n"
+            f"Режим: <b>{'наблюдение (DRY-RUN)' if d.get('dry_run', True) else 'удаление'}</b>\n"
+            f"Окно после команды: <b>{float(d.get('arm', 4.0)):.0f} с</b> · "
+            f"карантин: <b>{int(d.get('quarantine', 0)) or 'выкл'}</b>"
+            f"{' мин' if d.get('quarantine') else ''}\n"
+            f"Срабатываний: <b>{d.get('triggers', 0)}</b> · удалено: "
+            f"<b>{d.get('killed', 0)}</b> · не вышло: <b>{d.get('missed', 0)}</b>")
 
 
 # ═════════════════════════════════════════════════════════
@@ -1057,6 +1182,9 @@ async def on_edited(m: Message):
         cache_put(m)
     if own:
         return
+    # команду докса могут дописать правкой — проверяем новый текст
+    if await antidox_check(m, owner_id, edited=True):
+        return
 
     u = user(owner_id)
     if not u.get("track_edits", True) or not c:
@@ -1084,6 +1212,8 @@ async def on_business_message(m: Message):
     cache_put(m)
 
     if not (m.from_user and m.from_user.id == owner_id):
+        if await antidox_check(m, owner_id):     # ← докс: раньше всего остального
+            return
         await guard_incoming(m, owner_id)        # ← входящее: проверяем
         if user(owner_id).get("save_when", "deleted") == "always":
             asyncio.create_task(archive_media(m, owner_id))
@@ -1407,6 +1537,8 @@ HELP = {
 <code>.word +слово</code> · <code>.word -слово</code> — стоп-слова
 <code>.away текст</code> · <code>.away off</code> — автоответ «я отошёл»
 <code>.quiet 23:00-08:00</code> · <code>.quiet off</code> — тихие часы
+<code>.dox</code> — анти-докс: команда «dox/пробив» и выкладка за ней
+<code>.dox kill</code> — из наблюдения в боевой · <code>.dox q 30</code> — карантин
 <code>/log</code> — журнал срабатываний"""),
 
     "style": ("🎨", "Стиль", """🎨 <b>Стиль речи</b>
@@ -1618,6 +1750,33 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         u["digest"] = not u.get("digest")
         save(uid)
         return await note(f"📬 Сводка за день: {'вкл ✅ (в 21:00)' if u['digest'] else 'выкл ❌'}")
+
+    if name in ("dox", "antidox"):
+        d = adox(u)
+        a = args.strip().lower()
+        words = a.split()
+        if a in ("on", "вкл"):
+            d["enabled"] = True
+        elif a in ("off", "выкл"):
+            d["enabled"] = False
+        elif a in ("dry", "тест", "наблюдение"):
+            d["dry_run"] = True
+        elif a in ("kill", "боевой", "удалять"):
+            d["dry_run"] = False
+        elif len(words) == 2 and words[0] in ("arm", "окно") and words[1].isdigit():
+            d["arm"] = float(max(1, min(30, int(words[1]))))
+        elif len(words) == 2 and words[0] in ("q", "карантин") and words[1].isdigit():
+            d["quarantine"] = max(0, min(1440, int(words[1])))
+        elif a:
+            return await note(
+                "🕵️ <code>.dox on|off</code> — вкл/выкл\n"
+                "<code>.dox dry</code> — только докладывать · "
+                "<code>.dox kill</code> — удалять\n"
+                "<code>.dox arm 4</code> — секунд ждать выкладку после команды\n"
+                "<code>.dox q 30</code> — карантин: минут удалять от него всё (0 = выкл)\n\n"
+                + dox_status(u))
+        save(uid)
+        return await note(dox_status(u))
 
     if name == "word":
         a = args.strip()
@@ -2020,7 +2179,7 @@ async def handle_cmd(m: Message, uid: int, raw: str):
 
 KNOWN_CMDS = sorted({
     "scam", "filter", "sens", "trust", "untrust", "mute", "unmute", "check",
-    "word", "away", "quiet", "digest", "help", "me", "menu", "mode", "here",
+    "word", "away", "quiet", "digest", "dox", "antidox", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
     "nuke", "wipe", "delchat", "удалить",
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
@@ -2245,7 +2404,10 @@ async def screen(uid: int, name: str, arg: str = "") -> tuple[str, InlineKeyboar
         ]
         rows += choice(u, "sens", "guard",
                        [("low", "мягко"), ("normal", "обычно"), ("high", "строго")])
-        rows += [[B("🔪 Журнал срабатываний", "n:log:0")],
+        dx = adox(u)
+        rows += [[B(f"{dot(dx.get('enabled', True))} Анти-докс"
+                    f"{' · DRY-RUN' if dx.get('dry_run', True) else ''} ›", "n:dox")],
+                 [B("🔪 Журнал срабатываний", "n:log:0")],
                  [B("‹ Меню", "n:root")]]
         return (f"🛡 <b>Защита</b>\n\n"
                 f"<b>Антискам</b> читает первое сообщение от незнакомого человека и "
@@ -2287,6 +2449,25 @@ async def screen(uid: int, name: str, arg: str = "") -> tuple[str, InlineKeyboar
                 "Работает только на первом сообщении от того, с кем ты ещё не общался. "
                 "Знакомые и доверенные проходят мимо фильтра всегда.\n\n"
                 "⚠️ Для удаления нужно право «удалять любые сообщения».",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+
+    if name == "dox":
+        adox(u)
+        rows = toggles(u, "dox", [
+            ("antidox.enabled", "Анти-докс включён"),
+            ("antidox.dry_run", "Только наблюдать (DRY-RUN)"),
+        ])
+        rows += choice(u, "antidox.arm", "dox",
+                       [(2.0, "2 с"), (4.0, "4 с"), (8.0, "8 с")])
+        rows += choice(u, "antidox.quarantine", "dox",
+                       [(0, "без карантина"), (5, "5 мин"), (30, "30 мин")])
+        rows.append([B("‹ Защита", "n:guard")])
+        return (dox_status(u) + "\n\n"
+                "<i>Докс-боты шлют команду («dox», «пробив»), а следом выкладку. "
+                "Команду бот удаляет сразу и несколько секунд удаляет всё, что тот "
+                "человек пришлёт следом. В DRY-RUN только докладывает — "
+                "посмотри на отчёты, потом выключай его.</i>\n\n"
+                "⚠️ Нужно право «удалять любые сообщения».",
                 InlineKeyboardMarkup(inline_keyboard=rows))
 
     if name == "words":
@@ -2523,6 +2704,10 @@ async def setval(cb: CallbackQuery):
         u["mode_level"] = val if val in LEVELS else "normal"
     elif path == "save_when":
         u["save_when"] = val if val in ("always", "deleted") else "deleted"
+    elif path == "antidox.arm" and val in ("2.0", "4.0", "8.0"):
+        adox(u)["arm"] = float(val)
+    elif path == "antidox.quarantine" and val in ("0", "5", "30"):
+        adox(u)["quarantine"] = int(val)
     else:
         return await cb.answer()
     save(cb.from_user.id)
@@ -2849,6 +3034,9 @@ function viewGuard(){
   ${sw("numbers","Номера и карты","", D.numbers)}
   ${sw("buttons","Инлайн-кнопки","", D.buttons)}
   ${sw("words_on","Стоп-слова","список ниже", D.words_on)}
+  <h2>Анти-докс</h2>
+  ${sw("dox","Анти-докс","команда «dox / пробив» и выкладка следом", D.dox)}
+  ${sw("dox_dry","Только наблюдать","DRY-RUN: докладывать, не удалять", D.dox_dry)}
   <div class="field"><label>Добавить стоп-слово</label>
     <input id="w" placeholder="например: казино" onchange="addWord(this)"></div>
   <div class="chips" id="chips">${(D.words||[]).map((w,i)=>
@@ -2974,6 +3162,7 @@ async def api_state(request):
         "filter": f["enabled"], "filter_delete": f["delete"], "links": f["links"],
         "numbers": f["numbers"], "buttons": f["buttons"], "words_on": f["words_on"],
         "words": f["words"], "sens": u.get("sens", "normal"),
+        "dox": adox(u).get("enabled", True), "dox_dry": adox(u).get("dry_run", True),
         "quiet": u.get("quiet", ""), "away": u.get("away", ""),
         "away_on": u.get("away_on", False),
         "media": n, "media_size": human_size(sz), "caught": u["caught"],
@@ -2988,6 +3177,7 @@ WEB_KEYS = {
     "filter": "filter.enabled", "filter_delete": "filter.delete",
     "links": "filter.links", "numbers": "filter.numbers",
     "buttons": "filter.buttons", "words_on": "filter.words_on",
+    "dox": "antidox.enabled", "dox_dry": "antidox.dry_run",
     "antidelete": "antidelete", "save_media": "save_media", "save_own": "save_own",
     "track_edits": "track_edits", "digest": "digest", "away_on": "away_on",
     "mode_bold": "mode_bold", "mode_emoji": "mode_emoji",
