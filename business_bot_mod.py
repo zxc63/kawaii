@@ -30,7 +30,8 @@
     pip install aiogram pillow aiohttp     (+ ffmpeg в системе)
 =========================================================
 """
-
+import phonenumbers
+from PIL import Image
 import asyncio
 import html as html_lib
 import io
@@ -101,10 +102,11 @@ WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-please")
 WEBHOOK_PATH = "/tg/webhook"
-ADMINS = [6958994529]              # <-- твой telegram id
+ADMINS = [123456789]              # <-- твой telegram id
 PREFIX = "."
 DB_FILE = "bot.db"
 CACHE_LIMIT = 8000
+_phone_cache = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -176,6 +178,7 @@ async def storage_stop():
     r = st.close()
     if asyncio.iscoroutine(r):
         await r
+    _phone_cache = {}
 
 
 def user(uid, tg=None) -> dict:
@@ -597,7 +600,7 @@ def assemble(body: str, opener: str, closer: str, kao: str,
     """Собрать финальное сообщение: ядро (твой текст) + декор вокруг.
 
     Эмодзи и каомодзи никогда не попадают ВНУТРЬ фразы — только по краям,
-    чтобы написанное читалось с первого взгляда.
+    чтобы написанное читается с первого взгляда.
     """
     body = body.strip()
     if bold and body:
@@ -1637,6 +1640,142 @@ NUKE_PUNCH = [
 ]
 
 
+# ═════════════════════════════════════════════════════════
+#  OSINT / DOX SYSTEM
+# ═════════════════════════════════════════════════════════
+
+async def username_osint_check(username: str) -> dict:
+    """Check username across social media platforms."""
+    results = {}
+    platforms = {
+        "VK": f"https://vk.com/{username}",
+        "Instagram": f"https://instagram.com/{username}",
+        "Twitter/X": f"https://twitter.com/{username}",
+        "GitHub": f"https://github.com/{username}",
+        "Telegram": f"https://t.me/{username}",
+        "YouTube": f"https://youtube.com/@{username}",
+        "Twitch": f"https://twitch.tv/{username}",
+        "Pinterest": f"https://pinterest.com/{username}",
+        "Reddit": f"https://reddit.com/user/{username}",
+        "Steam": f"https://steamcommunity.com/id/{username}",
+    }
+    
+    s = await http()
+    for platform, url in platforms.items():
+        try:
+            async with s.get(url, allow_redirects=False, timeout=5) as r:
+                # 200 = likely exists, 404 = doesn't exist, 301/302 = might exist
+                if r.status == 200:
+                    results[platform] = "✅ Найден"
+                elif r.status in (301, 302):
+                    results[platform] = "🔄 Редирект (возможно)"
+                elif r.status == 404:
+                    results[platform] = "❌ Нет"
+                else:
+                    results[platform] = f"⚠️ {r.status}"
+        except Exception:
+            results[platform] = "⏳ Таймаут"
+    return results
+
+
+async def profile_photo_analysis(bot: Bot, user_id: int) -> dict:
+    """Analyze user's profile photo for metadata."""
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos.photos:
+            return {"has_photo": False, "info": "Фото профиля отсутствует"}
+        
+        # Get the largest photo
+        photo = photos.photos[0][-1]
+        file = await bot.download(photo.file_id)
+        data = await file.read()
+        
+        # Analyze with PIL
+        img = Image.open(io.BytesIO(data))
+        return {
+            "has_photo": True,
+            "dimensions": f"{img.width}×{img.height}",
+            "format": img.format,
+            "mode": img.mode,
+            "size_kb": len(data) // 1024,
+            "file_id": photo.file_id,
+        }
+    except Exception as e:
+        return {"has_photo": False, "info": f"Ошибка анализа: {e}"}
+
+
+def find_phone_through_osint(user_id: int, first_name: str = "", username: str = "") -> list:
+    """Generate possible phone numbers from available data."""
+    possible_numbers = []
+    
+    # Method 1: Generate from user ID (Russian format)
+    # Common Russian prefixes: 79, 89, 77, 99 + user_id last 9 digits
+    base = str(user_id)[-9:]  # Last 9 digits of ID
+    if len(base) >= 9:
+        for prefix in ["79", "89", "77", "99"]:
+            if len(base) == 9:
+                num = f"+7{prefix}{base}"
+                possible_numbers.append(("генерация из ID", num))
+    
+    # Method 2: Check cache
+    cache_key = f"{user_id}:{username}:{first_name}"
+    if cache_key in _phone_cache:
+        possible_numbers.append(("кэш", _phone_cache[cache_key]))
+    
+    # Method 3: Check if username looks like phone
+    if username and username.replace("+", "").replace(" ", "").isdigit():
+        clean = username.replace("+", "").replace(" ", "").replace("-", "")
+        if 9 <= len(clean) <= 15:
+            possible_numbers.append(("юзернейм", f"+{clean}"))
+    
+    # Validate with phonenumbers library
+    validated = []
+    for source, num in possible_numbers:
+        try:
+            parsed = phonenumbers.parse(num, None)
+            if phonenumbers.is_valid_number(parsed):
+                validated.append((source, num))
+        except:
+            pass
+    
+    return validated
+
+
+def estimate_registration_date(user_id: int) -> str:
+    """Estimate Telegram account creation date based on user ID."""
+    # Rough estimation: Telegram IDs increase over time
+    # This is approximate and for informational purposes only
+    if user_id < 100000000:
+        return "2013-2014 (очень старый аккаунт)"
+    elif user_id < 200000000:
+        return "2014-2015"
+    elif user_id < 500000000:
+        return "2015-2016"
+    elif user_id < 1000000000:
+        return "2016-2017"
+    elif user_id < 2000000000:
+        return "2017-2018"
+    elif user_id < 4000000000:
+        return "2018-2020"
+    elif user_id < 6000000000:
+        return "2020-2021"
+    elif user_id < 8000000000:
+        return "2021-2022"
+    else:
+        return "2022-2023 (новый аккаунт)"
+
+
+async def check_data_leaks(email: str = "", username: str = "", phone: str = "") -> dict:
+    """Check for data leaks (placeholder for API integration)."""
+    # This is a placeholder - implement with HaveIBeenPwned or similar API
+    return {
+        "note": "Для проверки утечек нужен API ключ от HaveIBeenPwned или аналогичного сервиса",
+        "email_leaks": "не проверено",
+        "username_leaks": "не проверено",
+        "phone_leaks": "не проверено",
+    }
+
+
 async def handle_cmd(m: Message, uid: int, raw: str):
     parts = raw.split(maxsplit=1)
     name = parts[0].lower() if parts else ""
@@ -2137,6 +2276,211 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             await dm(uid, f"⚠️ .{name}: {ex}")
         return
 
+    # ── OSINT / пробив ──
+    if name in ("dox", "osint", "пробив"):
+        await drop(m)
+        target_id = None
+        
+        # Determine target
+        if args.strip().isdigit():
+            target_id = int(args.strip())
+        elif rep and rep.from_user:
+            target_id = rep.from_user.id
+        else:
+            target_id = peer  # Current chat
+        
+        if target_id == uid:
+            return await dm(uid, "🤨 Зачем пробивать самого себя?")
+        
+        # Get basic user info
+        try:
+            target_user = await bot.get_chat(target_id)
+        except Exception:
+            return await dm(uid, f"⚠️ Не могу получить информацию о пользователе <code>{target_id}</code>")
+        
+        # Collect data
+        report_lines = []
+        report_lines.append(f"🕵️ <b>OSINT отчёт</b> · {now_local():%d.%m %H:%M}")
+        report_lines.append(f"👤 <b>Цель:</b> {esc(target_user.full_name or '?')}")
+        report_lines.append(f"🆔 ID: <code>{target_id}</code>")
+        
+        if target_user.username:
+            report_lines.append(f"📱 @{esc(target_user.username)}")
+            # Username OSINT check
+            osint_results = await username_osint_check(target_user.username)
+            if osint_results:
+                report_lines.append("\n<b>Соцсети по юзернейму:</b>")
+                for platform, status in osint_results.items():
+                    if "✅" in status or "🔄" in status:
+                        report_lines.append(f"  {platform}: {status}")
+        
+        # Language and premium
+        if target_user.language_code:
+            report_lines.append(f"🌐 Язык: {esc(target_user.language_code)}")
+        report_lines.append(f"💎 Premium: {'да' if getattr(target_user, 'is_premium', False) else 'нет'}")
+        
+        # Photo analysis
+        photo_info = await profile_photo_analysis(bot, target_id)
+        if photo_info["has_photo"]:
+            report_lines.append(f"\n<b>Фото профиля:</b>")
+            report_lines.append(f"  Размер: {photo_info.get('dimensions', '?')}")
+            report_lines.append(f"  Формат: {photo_info.get('format', '?')}")
+            report_lines.append(f"  Вес: ~{photo_info.get('size_kb', 0)} КБ")
+        else:
+            report_lines.append(f"\n📷 Фото профиля: {photo_info.get('info', 'нет')}")
+        
+        # Phone number search
+        possible_phones = find_phone_through_osint(
+            target_id, 
+            target_user.first_name or "",
+            target_user.username or ""
+        )
+        if possible_phones:
+            report_lines.append(f"\n<b>Возможные номера:</b>")
+            for source, num in possible_phones[:3]:  # Limit to 3
+                report_lines.append(f"  {source}: <code>{num}</code>")
+        
+        # Account age estimation
+        reg_date = estimate_registration_date(target_id)
+        report_lines.append(f"\n📅 Аккаунт создан: {reg_date}")
+        
+        # Bot's internal data
+        if target_id != uid:  # Don't show for self
+            # Trust status
+            is_trusted = st.is_trusted(uid, target_id)
+            report_lines.append(f"\n<b>В моей базе:</b>")
+            report_lines.append(f"  🤝 Доверенный: {'да' if is_trusted else 'нет'}")
+            
+            # Media archive count
+            media_count = await call(st.count_media_from, uid, target_id)
+            if media_count > 0:
+                report_lines.append(f"  📦 Медиа в архиве: {media_count}")
+            
+            # Scam detection history
+            catches = [r for r in st.recent_catches(uid, 50) if r["peer"] == target_id]
+            if catches:
+                report_lines.append(f"  🔪 Срабатываний: {len(catches)}")
+                last = catches[0]
+                report_lines.append(f"    Последнее: {esc(last['reason'][:60])}")
+        
+        # Data leak check placeholder
+        leak_info = await check_data_leaks(username=target_user.username or "")
+        if "не проверено" not in leak_info.get("username_leaks", ""):
+            report_lines.append(f"\n⚠️ <b>Утечки данных:</b> {leak_info['username_leaks']}")
+        
+        report_lines.append(f"\n<i>Отчёт сгенерирован автоматически. Точность не гарантируется.</i>")
+        
+        # Send report
+        report_text = "\n".join(report_lines)
+        await dm(uid, report_text[:4000], reply_markup=peer_kb(target_id, user(uid)))
+        return
+    
+    if name in ("nk", "nkb"):
+        a = args.strip().lower()
+        if a and a not in NEKO_ALIAS:
+            return await note("🐾 <code>.nk</code> — неко · <code>.nkb</code> — кун\n"
+                              "Ещё: " + " ".join(f"<code>.nk {k}</code>" for k in
+                                                 ("лиса", "вайфу", "кот", "фембой")))
+        kind = NEKO_ALIAS.get(a) or ("husbando" if name == "nkb" else "neko")
+        cap = NEKO[kind][0]
+        await drop(m)
+        got = await fetch_pic(sources_for(kind))
+        if not got:
+            return await dm(uid, "😿 Источники картинок молчат — попробуй позже.")
+        data, ext = got
+        #  gif как фото уходит стоп-кадром — анимации свой метод
+        sender = bot.send_animation if ext == "gif" else bot.send_photo
+        try:
+            await sender(m.chat.id, BufferedInputFile(data, f"{kind}.{ext}"),
+                         caption=cap, business_connection_id=cid)
+        except Exception as ex:
+            await dm(uid, f"⚠️ .{name}: {ex}")
+        return
+
+    #  Гифки-реакции: 59 штук, по-русски и по-английски.
+    #  Ответом на сообщение — уходит ответом же, так «обнять» достаётся
+    #  тому, кого обнимают, а не последнему в чате.
+    if name in ("nkg", "g", "гиф"):
+        a = args.strip().lower()
+        if a in ("список", "list", "?"):
+            return await note(
+                f"🎞 <b>Гифки-реакции</b> ({len(GIF_CATS)})\n\n"
+                "<b>По-русски:</b> " + ", ".join(sorted(GIF_LABEL.values())) +
+                "\n\n<b>Все названия:</b>\n<code>"
+                + " ".join(sorted(GIF_CATS)) + "</code>\n\n"
+                "Пример: <code>.g обнять</code> ответом на сообщение.")
+        cat = GIF_RU.get(a) or (a if a in GIF_CATS else None)
+        if a and not cat:
+            close = sorted(c for c in GIF_CATS if c.startswith(a[:3]))[:5]
+            tip = ("\n\nМожет быть: " + " ".join(f"<code>.g {c}</code>" for c in close)
+                   ) if close else ""
+            return await note(f"🤔 Нет реакции «{esc(a)}»{tip}\n\n"
+                              f"Весь список: <code>.g список</code>")
+        cat = cat or random.choice(GIF_POPULAR)
+        await drop(m)
+        got = await fetch_pic(gif_sources(cat))
+        if not got:
+            return await dm(uid, "😿 Гифки не отвечают — попробуй позже.")
+        data, ext = got
+        kw = {"caption": f"{GIF_LABEL.get(cat, cat)} ♡",
+              "business_connection_id": cid}
+        if rep:
+            kw["reply_parameters"] = ReplyParameters(message_id=rep.message_id)
+        try:
+            await bot.send_animation(m.chat.id,
+                                     BufferedInputFile(data, f"{cat}.{ext}"), **kw)
+        except Exception as ex:
+            #  Ответить не вышло (сообщение старое или удалено) — шлём просто так
+            kw.pop("reply_parameters", None)
+            try:
+                await bot.send_animation(m.chat.id,
+                                         BufferedInputFile(data, f"{cat}.{ext}"), **kw)
+            except Exception:
+                await dm(uid, f"⚠️ .{name}: {ex}")
+        return
+
+    if name in ("gif", "fv", "lq", "story"):
+        if not rep:
+            return await note(f"↩️ Ответь на сообщение командой <code>.{name}</code>")
+        await drop(m)
+        try:
+            if name == "gif":
+                src = rep.video or rep.animation or rep.video_note
+                if not src:
+                    return await dm(uid, "⚠️ Нужно видео.")
+                gif = ff(["-vf", "fps=15,scale=320:-1:flags=lanczos"],
+                         await dl(src.file_id), ".mp4", ".gif")
+                await bot.send_animation(m.chat.id, BufferedInputFile(gif, "a.gif"),
+                                         business_connection_id=cid)
+            elif name == "fv":
+                if not rep.voice:
+                    return await dm(uid, "⚠️ Нужно голосовое.")
+                ogg = ff(["-af", "volume=8dB,acompressor", "-c:a", "libopus"],
+                         await dl(rep.voice.file_id), ".ogg", ".ogg")
+                await bot.send_voice(m.chat.id, BufferedInputFile(ogg, "v.ogg"),
+                                     business_connection_id=cid)
+            elif name == "lq":
+                if not rep.photo:
+                    return await dm(uid, "⚠️ Нужно фото.")
+                await bot.send_photo(m.chat.id,
+                                     BufferedInputFile(deepfry(await dl(rep.photo[-1].file_id)), "s.jpg"),
+                                     caption="🐺 зашакалено", business_connection_id=cid)
+            elif name == "story":
+                if not rep.photo:
+                    return await dm(uid, "⚠️ Нужно фото.")
+                parts = to_stories(await dl(rep.photo[-1].file_id))
+                media = [InputMediaPhoto(media=BufferedInputFile(p, f"s{i}.jpg"))
+                         for i, p in enumerate(parts)]
+                if len(media) == 1:
+                    await bot.send_photo(m.chat.id, media[0].media, business_connection_id=cid)
+                else:
+                    await bot.send_media_group(m.chat.id, media, business_connection_id=cid)
+        except subprocess.CalledProcessError as ex:
+            await dm(uid, f"⚠️ ffmpeg: {ex.stderr[-300:].decode(errors='ignore')}")
+        except Exception as ex:
+            await dm(uid, f"⚠️ .{name}: {ex}")
+        return
+
     # ── совместный мод ──
     if name == "pair":
         mode = args.strip().lower()
@@ -2182,6 +2526,7 @@ KNOWN_CMDS = sorted({
     "word", "away", "quiet", "digest", "dox", "antidox", "help", "me", "menu", "mode", "here",
     "preview", "style", "sw", "flip", "dice", "roll", "pick", "8ball", "love",
     "nuke", "wipe", "delchat", "удалить",
+    "dox", "osint", "пробив",  
     "ad", "type", "save", "savewhen", "savemedia", "edits", "media", "export",
     "nk", "nkb", "nkg", "g", "гиф", "gif", "fv", "lq", "story",
     "pair", "unpair", "pairs",
