@@ -2482,7 +2482,7 @@ async def handle_cmd(m: Message, uid: int, raw: str):
     return await note(f"🤔 Не знаю команду <code>.{esc(name)}</code>{tip}",
                       reply_markup=help_kb())
 
-=@dp.callback_query(F.data.startswith("pair:"))
+@dp.callback_query(F.data.startswith("pair:"))
 async def on_pair(cb: CallbackQuery):
     _, verdict, initiator, mode = cb.data.split(":")
     initiator, responder = int(initiator), cb.from_user.id
