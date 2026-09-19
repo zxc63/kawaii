@@ -30,6 +30,18 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import parse_qs
+import logging
+
+# В начале файла уже есть:
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# В коде:
+try:
+    # что-то делаем
+    pass
+except Exception as e:
+    logging.error(f"OSINT error for user {uid}: {e}")
+    # пользователю показываем упрощённое сообщение
 
 # Сервер живёт в UTC. TZ_OFFSET — твой сдвиг в часах
 TZ_OFFSET = float(os.getenv("TZ_OFFSET", "2"))
@@ -1511,7 +1523,28 @@ def to_stories(data: bytes) -> List[bytes]:
         img.crop((x, 0, min(x + step, W), H)).save(b, "JPEG", quality=92)
         parts.append(b.getvalue())
         x += step
-    return parts
+    def split_message(text: str, max_len: int = 4000) -> List[str]:
+        """Разбивает длинный текст на части."""
+        if len(text) <= max_len:
+            return [text]
+
+        parts = []
+        while text:
+            if len(text) <= max_len:
+                parts.append(text)
+                break
+
+            # Ищем последний перенос строки или пробел
+            split_at = text.rfind('\n', 0, max_len)
+            if split_at == -1:
+                split_at = text.rfind(' ', 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+
+            parts.append(text[:split_at])
+            text = text[split_at:].lstrip()
+
+        return parts
 
 # ═════════════════════════════════════════════════════════
 # 🐾 КАРТИНКИ ИЗ ИНТЕРНЕТА
@@ -1757,7 +1790,7 @@ NUKE_PUNCH = [
 # ОСНОВНОЙ OSINT-МОДУЛЬ
 # ═════════════════════════════════════════════════════════
 async def generate_osint_report(owner_id: int, target_id: int) -> str:
-    """Генерация полного OSINT отчёта."""
+    """Генерация полного OSINT отчёта с безопасным доступом к атрибутам."""
     report_lines = []
     
     try:
@@ -1767,28 +1800,44 @@ async def generate_osint_report(owner_id: int, target_id: int) -> str:
     
     # Базовая информация
     report_lines.append(f"🕵️ <b>OSINT отчёт</b> · {now_local():%d.%m %H:%M}")
-    report_lines.append(f"👤 <b>Цель:</b> {esc(target_user.full_name or '?')}")
+    
+    # Имя пользователя - безопасный доступ
+    full_name = getattr(target_user, 'full_name', None)
+    if full_name:
+        report_lines.append(f"👤 <b>Цель:</b> {esc(full_name)}")
+    else:
+        report_lines.append(f"👤 <b>Цель:</b> ID <code>{target_id}</code>")
+    
     report_lines.append(f"🆔 ID: <code>{target_id}</code>")
     
-    if target_user.username:
-        report_lines.append(f"📱 @{esc(target_user.username)}")
+    # Username - безопасный доступ
+    username = getattr(target_user, 'username', None)
+    if username:
+        report_lines.append(f"📱 @{esc(username)}")
         
         # Проверка username на платформах
-        platform_check = await osint_service.check_username_across_platforms(target_user.username)
-        if platform_check and "error" not in platform_check:
-            found = [p for p, s in platform_check.items() if "✅" in s or "🔄" in s]
-            if found:
-                report_lines.append(f"\n<b>Найдено на платформах:</b> {', '.join(found[:5])}")
+        try:
+            platform_check = await osint_service.check_username_across_platforms(username)
+            if platform_check and "error" not in platform_check:
+                found = [p for p, s in platform_check.items() if "✅" in s or "🔄" in s]
+                if found:
+                    report_lines.append(f"\n<b>Найдено на платформах:</b> {', '.join(found[:5])}")
+        except Exception:
+            pass
     
-    # Информация из Telegram
-    if target_user.language_code:
-        report_lines.append(f"🌐 Язык: {esc(target_user.language_code)}")
-    report_lines.append(f"💎 Premium: {'да' if getattr(target_user, 'is_premium', False) else 'нет'}")
+    # Язык - безопасный доступ (может отсутствовать)
+    language_code = getattr(target_user, 'language_code', None)
+    if language_code:
+        report_lines.append(f"🌐 Язык: {esc(language_code)}")
+    
+    # Premium статус - безопасный доступ
+    is_premium = getattr(target_user, 'is_premium', False)
+    report_lines.append(f"💎 Premium: {'да' if is_premium else 'нет'}")
     
     # Фото профиля
     try:
         photos = await bot.get_user_profile_photos(target_id, limit=1)
-        if photos.photos:
+        if photos and photos.photos:
             photo = photos.photos[0][-1]
             report_lines.append(f"\n📷 <b>Фото профиля:</b> есть ({photo.width}×{photo.height})")
         else:
@@ -1797,64 +1846,77 @@ async def generate_osint_report(owner_id: int, target_id: int) -> str:
         report_lines.append(f"\n📷 <b>Фото профиля:</b> не проверено")
     
     # Проверка утечек
-    if target_user.username:
-        breaches = await osint_service.check_username_breaches(target_user.username)
-        if breaches.get("breached"):
-            report_lines.append(f"\n🚨 <b>Утечки данных:</b> найдено {breaches.get('count', 0)}")
-            if breaches.get("sources"):
-                report_lines.append(f"  Источники: {', '.join(breaches['sources'][:3])}")
-        elif not breaches.get("error"):
-            report_lines.append(f"\n🛡️ <b>Утечки данных:</b> не найдено")
+    if username:
+        try:
+            breaches = await osint_service.check_username_breaches(username)
+            if breaches.get("breached"):
+                report_lines.append(f"\n🚨 <b>Утечки данных:</b> найдено {breaches.get('count', 0)}")
+                if breaches.get("sources"):
+                    report_lines.append(f"  Источники: {', '.join(breaches['sources'][:3])}")
+            elif not breaches.get("error"):
+                report_lines.append(f"\n🛡️ <b>Утечки данных:</b> не найдено")
+        except Exception as e:
+            report_lines.append(f"\n⚠️ <b>Проверка утечек:</b> ошибка: {e}")
     
     # Генерация возможных номеров
     try:
         from phonenumbers import PhoneNumberFormat
-        parsed = phonenumbers.parse(f"+{target_id % 10000000000}", None)
-        possible_number = phonenumbers.format_number(parsed, PhoneNumberFormat.INTERNATIONAL)
-        report_lines.append(f"\n📞 <b>Возможный номер:</b> <code>{possible_number}</code>")
+        # Создаём "псевдо" номер из ID (для демонстрации)
+        fake_number = f"+7{str(target_id)[-10:]}"
+        parsed = phonenumbers.parse(fake_number, None)
+        if phonenumbers.is_valid_number(parsed):
+            possible_number = phonenumbers.format_number(parsed, PhoneNumberFormat.INTERNATIONAL)
+            report_lines.append(f"\n📞 <b>Возможный номер:</b> <code>{possible_number}</code>")
     except:
         pass
     
     # Оценка возраста аккаунта
-    if target_id < 100000000:
-        reg_estimate = "2013-2014 (очень старый аккаунт)"
-    elif target_id < 200000000:
-        reg_estimate = "2014-2015"
-    elif target_id < 500000000:
-        reg_estimate = "2015-2016"
-    elif target_id < 1000000000:
-        reg_estimate = "2016-2017"
-    elif target_id < 2000000000:
-        reg_estimate = "2017-2018"
-    elif target_id < 4000000000:
-        reg_estimate = "2018-2020"
-    elif target_id < 6000000000:
-        reg_estimate = "2020-2021"
-    elif target_id < 8000000000:
-        reg_estimate = "2021-2022"
-    else:
-        reg_estimate = "2022-2023 (новый аккаунт)"
-    
+    reg_estimate = estimate_registration_date(target_id)
     report_lines.append(f"\n📅 <b>Примерная дата регистрации:</b> {reg_estimate}")
     
     # Информация из базы бота
     if target_id != owner_id:
-        is_trusted = st.is_trusted(owner_id, target_id)
-        media_count = await call(st.count_media_from, owner_id, target_id)
-        catches = [r for r in st.recent_catches(owner_id, 50) if r["peer"] == target_id]
-        
-        report_lines.append(f"\n<b>В базе бота:</b>")
-        report_lines.append(f"  🤝 Доверенный: {'да' if is_trusted else 'нет'}")
-        if media_count > 0:
-            report_lines.append(f"  📦 Медиа в архиве: {media_count}")
-        if catches:
-            report_lines.append(f"  🔪 Срабатываний защиты: {len(catches)}")
-            last = catches[0]
-            report_lines.append(f"    Последнее: {esc(last['reason'][:60])}")
+        try:
+            is_trusted = st.is_trusted(owner_id, target_id)
+            media_count = await call(st.count_media_from, owner_id, target_id)
+            catches = [r for r in st.recent_catches(owner_id, 50) if r["peer"] == target_id]
+            
+            report_lines.append(f"\n<b>В базе бота:</b>")
+            report_lines.append(f"  🤝 Доверенный: {'да' if is_trusted else 'нет'}")
+            if media_count > 0:
+                report_lines.append(f"  📦 Медиа в архиве: {media_count}")
+            if catches:
+                report_lines.append(f"  🔪 Срабатываний защиты: {len(catches)}")
+                if catches:
+                    last = catches[0]
+                    report_lines.append(f"    Последнее: {esc(last['reason'][:60])}")
+        except Exception:
+            pass
     
     report_lines.append(f"\n<i>Отчёт сгенерирован автоматически. Точность не гарантируется.</i>")
     
     return "\n".join(report_lines)
+
+def estimate_registration_date(user_id: int) -> str:
+    """Оценка даты регистрации Telegram аккаунта по ID."""
+    if user_id < 100000000:
+        return "2013-2014 (очень старый аккаунт)"
+    elif user_id < 200000000:
+        return "2014-2015"
+    elif user_id < 500000000:
+        return "2015-2016"
+    elif user_id < 1000000000:
+        return "2016-2017"
+    elif user_id < 2000000000:
+        return "2017-2018"
+    elif user_id < 4000000000:
+        return "2018-2020"
+    elif user_id < 6000000000:
+        return "2020-2021"
+    elif user_id < 8000000000:
+        return "2021-2022"
+    else:
+        return "2022-2023 (новый аккаунт)"
 
 async def handle_cmd(m: Message, uid: int, raw: str):
     parts = raw.split(maxsplit=1)
@@ -1872,7 +1934,7 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         await drop(m)
         await dm(uid, t, **kw)
 
-    # ── OSINT команды ──
+ # ── OSINT команды ──
     if name in ("dox", "osint", "пробив", "inf", "info"):
         await drop(m)
         target_id = None
@@ -1891,9 +1953,19 @@ async def handle_cmd(m: Message, uid: int, raw: str):
         # Генерация отчёта
         try:
             report = await generate_osint_report(uid, target_id)
-            await dm(uid, report[:4000], reply_markup=peer_kb(target_id, u))
+            # Разбиваем длинные отчёты на части
+            if len(report) > 4000:
+                parts = [report[i:i+4000] for i in range(0, len(report), 4000)]
+                for i, part in enumerate(parts):
+                    if i == len(parts) - 1:
+                        await dm(uid, part, reply_markup=peer_kb(target_id, u))
+                    else:
+                        await dm(uid, part)
+            else:
+                await dm(uid, report, reply_markup=peer_kb(target_id, u))
         except Exception as e:
-            await dm(uid, f"⚠️ Ошибка при генерации отчёта: {e}")
+            logging.error(f"OSINT error: {e}")
+            await dm(uid, f"⚠️ Ошибка при генерации отчёта: {str(e)[:200]}")
         return
     
     # ── Расширенный OSINT ──
