@@ -2201,6 +2201,7 @@ async def handle_cmd(m: Message, uid: int, raw: str):
             u["mode"] = None
             save()
             here = u["pairs"].get(str(peer))
+
             if here:
                 return await note(
                     f"🔕 Глобальный мод выключен.\n\n"
@@ -2221,29 +2222,34 @@ async def handle_cmd(m: Message, uid: int, raw: str):
     #  Перебивает глобальный именно в этом диалоге.
     if name == "here":
         a = args.strip().lower()
-        if a in ("off", "none", "стоп", "0"):
-            had = u["pairs"].pop(str(peer), None)
-            peer_user = user(peer)
-            if peer_user:
-                peer_user["pairs"].pop(str(uid), None)
-                save(peer)
+        cm = u.setdefault("chat_modes", {})
+        key = str(peer)
+        if a in ("clear", "reset", "auto", "global", "-"):
+            cm.pop(key, None)
             save()
-            if had:
-                return await note(f"🔕 Мод <b>{had}</b> выключен для этого чата. "
-                                  f"Глобальный (<b>{u['mode'] or 'выкл'}</b>) без изменений.")
-            return await note("🤷 В этом чате отдельного мода и не было.")
-        if a not in MODES:
-            cur = u["pairs"].get(str(peer))
-            glob = u["mode"] or "выкл"
-            here_txt = cur if cur else f"нет (действует глобальный: {glob})"
-            return await note(
-                "🎯 <code>.here kawaii|tsundere|yandere|leet</code> — мод только тут\n"
-                "<code>.here off</code> — убрать мод этого чата\n\n"
-                f"Сейчас в этом чате: <b>{here_txt}</b>")
-        u["pairs"][str(peer)] = a
-        save()
-        return await note(f"🎯 В этом чате теперь <b>{a}</b> "
-                          f"(перебивает глобальный). Убрать: <code>.here off</code>")
+            return await note(f"♻️ Чат снова слушается глобального "
+                              f"(<b>{u.get('mode') or 'выкл'}</b>).")
+        if a in ("off", "none", "стоп", "0"):
+            cm[key] = "off"
+            save()
+            return await note("🔕 Мод выключен только для этого чата "
+                              "(даже если глобальный включён).\n"
+                              "Вернуть к глобальному: <code>.here clear</code>")
+        if a in MODES:
+            cm[key] = a
+            save()
+            return await note(f"🎯 В этом чате теперь <b>{a}</b>. "
+                              f"Вернуть к глобальному: <code>.here clear</code>")
+        cur = cm.get(key)
+        glob = u.get("mode") or "выкл"
+        here_txt = ("выключен только тут" if cur == "off"
+                    else cur if cur
+                    else f"нет (действует глобальный: {glob})")
+        return await note(
+            "🎯 <code>.here kawaii|tsundere|yandere|leet</code> — мод только тут\n"
+            "<code>.here off</code> — выключить только в этом чате\n"
+            "<code>.here clear</code> — вернуть к глобальному\n\n"
+            f"Сейчас в этом чате: <b>{here_txt}</b>")
 
     if name == "preview":
         a = args.strip().lower()
