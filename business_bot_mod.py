@@ -83,7 +83,7 @@ WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-please")
 WEBHOOK_PATH = "/tg/webhook"
-ADMINS = [int(x) for x in os.getenv("ADMINS", "PASTE_YOUR_TELEGRAM_ID   ").split(",") if x]  # <-- твой telegram id
+ADMINS = [123456789]  # <-- твой telegram id
 PREFIX = "."
 DB_FILE = "bot.db"
 CACHE_LIMIT = 8000
@@ -1703,7 +1703,7 @@ HELP = {
 <code>.style soft|normal|max</code> — сколько декора
 <code>.style bold</code> · <code>.style emoji</code>
 <code>.preview</code> — как это будет выглядеть
-<code>.pair kawaii</code> · <code>.unpair</code> · <code>.pairs</code> — вдвоём
+<code>.here kawaii|off</code> — мод только для этого чата
 
 Разово, не меняя режим:
 <code>.kawaii текст</code> <code>.mock текст</code> <code>.small</code> <code>.bubble</code>
@@ -2196,36 +2196,43 @@ async def handle_cmd(m: Message, uid: int, raw: str):
 
     # ── моды ──
     if name == "mode":
-        a = args.strip().lower()
-        if a in ("off", "", "none"):
+              if a in ("off", "", "none"):
             u["mode"] = None
-            save(uid)
+            save()
+            here = u["pairs"].get(str(peer))
+            if here:
+                return await note(
+                    f"🔕 Глобальный мод выключен.\n\n"
+                    f"⚠️ Но в этом чате отдельно активен <b>{here}</b> "
+                    f"(совместный мод). Он приоритетнее глобального.\n"
+                    f"Выключить его тут: <code>.here off</code>")
             return await note("🔕 Мод выключен.")
-        if a not in MODES:
-            return await note("⚠️ Моды: " + ", ".join(MODES))
-        u["mode"] = a
-        save(uid)
-        return await note(f"✅ Мод: <b>{a}</b> ♡\n\n{preview(a, u)}")
 
+       # ── мод только для текущего чата ──
+    #  Перебивает глобальный именно в этом диалоге.
     if name == "here":
         a = args.strip().lower()
-        cm = u.setdefault("chat_modes", {})
-        if a in ("clear", "сброс"):
-            cm.pop(str(peer), None)
-            save(uid)
-            return await note("↩️ В этом диалоге снова общий мод.")
-        if a in ("off", "выкл"):
-            cm[str(peer)] = "off"
-            save(uid)
-            return await note("🔕 В этом диалоге пишем без мода.")
+        if a in ("off", "none", "стоп", "0"):
+            had = u["pairs"].pop(str(peer), None)
+            if user(peer)["pairs"].pop(str(uid), None):
+                await dm(peer, "👋 Собеседник выключил совместный мод в этом чате.")
+            save()
+            if had:
+                return await note(f"🔕 Мод <b>{had}</b> выключен для этого чата. "
+                                  f"Глобальный (<b>{u['mode'] or 'выкл'}</b>) без изменений.")
+            return await note("🤷 В этом чате отдельного мода и не было.")
         if a not in MODES:
-            return await note("🎯 <code>.here kawaii|…</code> — мод только здесь\n"
-                              "<code>.here off</code> — здесь без мода\n"
-                              "<code>.here clear</code> — вернуть общий\n\n"
-                              "Моды: " + ", ".join(MODES))
-        cm[str(peer)] = a
-        save(uid)
-        return await note(f"🎯 В этом диалоге мод <b>{a}</b>.\n\n{preview(a, u)}")
+            cur = u["pairs"].get(str(peer))
+            glob = u["mode"] or "выкл"
+            here_txt = cur if cur else f"нет (действует глобальный: {glob})"
+            return await note(
+                "🎯 <code>.here kawaii|tsundere|yandere|leet</code> — мод только тут\n"
+                "<code>.here off</code> — убрать мод этого чата\n\n"
+                f"Сейчас в этом чате: <b>{here_txt}</b>")
+        u["pairs"][str(peer)] = a
+        save()
+        return await note(f"🎯 В этом чате теперь <b>{a}</b> "
+                          f"(перебивает глобальный). Убрать: <code>.here off</code>")
 
     if name == "preview":
         a = args.strip().lower()
