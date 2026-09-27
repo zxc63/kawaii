@@ -2196,26 +2196,37 @@ async def handle_cmd(m: Message, uid: int, raw: str):
 
     # ── моды ──
     if name == "mode":
-              if a in ("off", "", "none"):
-                u["mode"] = None
-                save()
-                here = u["pairs"].get(str(peer))
-                if here:
-                    return await note(
+        a = args.strip().lower()
+        if a in ("off", "", "none"):
+            u["mode"] = None
+            save()
+            here = u["pairs"].get(str(peer))
+            if here:
+                return await note(
                     f"🔕 Глобальный мод выключен.\n\n"
                     f"⚠️ Но в этом чате отдельно активен <b>{here}</b> "
                     f"(совместный мод). Он приоритетнее глобального.\n"
                     f"Выключить его тут: <code>.here off</code>")
-                    return await note("🔕 Мод выключен.")
+            return await note("🔕 Мод выключен.")
+        if a in MODES:
+            u["mode"] = a
+            save()
+            return await note(f"🌍 Глобальный мод: <b>{a}</b>")
+        return await note(
+            "🎯 <code>.mode kawaii|tsundere|yandere|leet</code> — глобальный мод\n"
+            "<code>.mode off</code> — выключить глобальный мод\n\n"
+            f"Сейчас: <b>{u.get('mode') or 'выкл'}</b>")
 
-       # ── мод только для текущего чата ──
+    # ── мод только для текущего чата ──
     #  Перебивает глобальный именно в этом диалоге.
     if name == "here":
         a = args.strip().lower()
         if a in ("off", "none", "стоп", "0"):
             had = u["pairs"].pop(str(peer), None)
-            if user(peer)["pairs"].pop(str(uid), None):
-                await dm(peer, "👋 Собеседник выключил совместный мод в этом чате.")
+            peer_user = user(peer)
+            if peer_user:
+                peer_user["pairs"].pop(str(uid), None)
+                save(peer)
             save()
             if had:
                 return await note(f"🔕 Мод <b>{had}</b> выключен для этого чата. "
