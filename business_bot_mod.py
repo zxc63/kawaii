@@ -2197,16 +2197,16 @@ async def handle_cmd(m: Message, uid: int, raw: str):
     # ── моды ──
     if name == "mode":
               if a in ("off", "", "none"):
-            u["mode"] = None
-            save()
-            here = u["pairs"].get(str(peer))
-            if here:
-                return await note(
+                u["mode"] = None
+                save()
+                here = u["pairs"].get(str(peer))
+                if here:
+                    return await note(
                     f"🔕 Глобальный мод выключен.\n\n"
                     f"⚠️ Но в этом чате отдельно активен <b>{here}</b> "
                     f"(совместный мод). Он приоритетнее глобального.\n"
                     f"Выключить его тут: <code>.here off</code>")
-            return await note("🔕 Мод выключен.")
+                    return await note("🔕 Мод выключен.")
 
        # ── мод только для текущего чата ──
     #  Перебивает глобальный именно в этом диалоге.
